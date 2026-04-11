@@ -2,68 +2,70 @@ import os
 import logging
 import asyncio
 import re
-from telegram import Update, InputMediaVideo
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ContextTypes
-from telegram.constants import ParseMode
+from pyrogram import Client, filters
+from pyrogram.types import Message, InputMediaVideo
+
+# ============== CONFIGURATION ==============
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# States
-COLLECTING_VIDEOS = 1
-WAITING_FOR_COVER = 2
+# Bot Config
+API_ID = int(os.getenv("API_ID", "12345"))  # my.telegram.org se
+API_HASH = os.getenv("API_HASH", "your_api_hash")  # my.telegram.org se
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # BotFather se
+
+# Admin IDs - YAHAN APNA ID DAALO
+ADMIN_IDS = [6728678197]  # <-- Apna Telegram ID yahan daalo
+
+# Default caption template (blockquote ke saath)
+DEFAULT_CAPTION = """<blockquote expandable>💫 {anime_name} 💫</blockquote>
+<b>‣ Episode :</b> <code>{ep}</code>
+<b>‣ Season :</b> <code>{season}</code>
+<b>‣ Quality :</b> <code>{quality}</code>
+<b>‣ Audio :</b> {audio}
+
+<blockquote expandable>🚀 For More Join
+🔰 @KENSHIN_ANIME</blockquote>"""
 
 # Storage
-pending_videos = {}
-user_cover = {}
+pending_videos = {}  # user_id -> list of videos
 user_caption_template = {}
 
-# Admin IDs (set kar lena)
-ADMIN_IDS = [123456789]  # Apna Telegram ID yahan daal
-
-# Default caption template
-DEFAULT_CAPTION = """<b><blockquote>💫 {anime_name} 💫</blockquote>
-‣ Episode : {ep}
-‣ Season : {season}
-‣ Quality : {quality}
-‣ Audio : {audio}     
-━━━━━━━━━━━━━━━━━━━━━
-<blockquote>🚀 For More Join     
-🔰 [@KENSHIN_ANIME]</blockquote>    
-━━━━━━━━━━━━━━━━━━━━━</b>"""
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ============== HELPER FUNCTIONS ==============
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# ============== PATTERN DETECTION ==============
-
 def detect_anime_name(text, filename=""):
     """Detect anime name from caption or filename"""
-    patterns = [
-        r'🎬\s*ᴀɴɪᴍᴇ:\s*([^\n]+)',
-        r'📟\s*Episode.*?\n.*?🎧.*?\n.*?📀.*?\n([^\n]+)',
-        r'([A-Za-z\s]+)(?:\s*-\s*|\s*Ep(?:isode)?\s*\d+)',
-        r'([A-Za-z\s]+)(?:\s*S\d+|\s*-\s*\d+)',
-    ]
+    # Pattern 1: 🎬 ᴀɴɪᴍᴇ: Name
+    match = re.search(r'🎬\s*ᴀɴɪᴍᴇ:\s*([^\n]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
     
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+    # Pattern 2: 📟 Episode ... \n ... \n ... \nName
+    match = re.search(r'📟\s*Episode.*?\n.*?🎧.*?\n.*?📀.*?\n([^\n]+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    
+    # Pattern 3: Name - Ep XX or Name SXX
+    match = re.search(r'([A-Za-z][A-Za-z\s]+?)(?:\s*-\s*|\s*Ep(?:isode)?\s*\d+|\s*S\d+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
     
     # From filename
     if filename:
-        # Remove extension and common words
-        clean = re.sub(r'\.(mp4|mkv|avi)$', '', filename, flags=re.IGNORECASE)
+        clean = re.sub(r'\.(mp4|mkv|avi|mov)$', '', filename, flags=re.IGNORECASE)
         clean = re.sub(r'[_\-]', ' ', clean)
-        clean = re.sub(r'\d+', '', clean)
-        clean = re.sub(r'(S\d+|E\d+|EP\d+|Season|Episode|1080p|720p|480p|4K|2160p)', '', clean, flags=re.IGNORECASE)
-        return clean.strip() or "Unknown Anime"
+        clean = re.sub(r'\b\d{1,2}\b', '', clean)
+        clean = re.sub(r'\b(S\d+|E\d+|EP\d+|Season|Episode|1080p|720p|480p|360p|4K|2160p|HDR|BluRay|x264|HEVC|AAC)\b', '', clean, flags=re.IGNORECASE)
+        clean = clean.strip()
+        if clean and len(clean) > 2:
+            return clean
     
     return "Unknown Anime"
 
@@ -75,16 +77,24 @@ def detect_episode(text, filename=""):
         r'E(\d+)',
         r'⌬\s*Episode:\s*(\d+)',
         r'‣\s*Episode\s*:\s*(\d+)',
+        r'📟\s*Episode\s*-\s*(\d+)',
+        r'Ep\s*(\d+)\s*\[',
     ]
     
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).zfill(2)  # 01, 02 format
+            return match.group(1).zfill(2)
     
     # From filename
     if filename:
         match = re.search(r'(?:Ep|Episode|E)[\s\-]*(\d+)', filename, re.IGNORECASE)
+        if match:
+            return match.group(1).zfill(2)
+        match = re.search(r'[E\-](\d{1,2})', filename)
+        if match:
+            return match.group(1).zfill(2)
+        match = re.search(r'(\d{1,2})\s*\[', filename)
         if match:
             return match.group(1).zfill(2)
     
@@ -98,6 +108,8 @@ def detect_season(text, filename=""):
         r'⌬\s*Season:\s*(\d+)',
         r'‣\s*Season\s*:\s*(\d+)',
         r'\(\s*S(\d+)\s*\)',
+        r'S(\d+)\s+Ep',
+        r'\[S(\d+)\]',
     ]
     
     for pattern in patterns:
@@ -110,255 +122,276 @@ def detect_season(text, filename=""):
         match = re.search(r'S(\d+)', filename, re.IGNORECASE)
         if match:
             return match.group(1).zfill(2)
+        match = re.search(r'Season\s*(\d+)', filename, re.IGNORECASE)
+        if match:
+            return match.group(1).zfill(2)
     
     return "01"
 
 def detect_quality(text, filename=""):
     """Detect quality"""
     qualities = ['2160p', '4K', '1080p', '720p', '480p', '360p']
+    combined = text + " " + filename
     
     for q in qualities:
-        if q.lower() in text.lower() or q.lower() in filename.lower():
+        if q.lower() in combined.lower():
             return q
     
-    # Check patterns
-    patterns = [
-        r'(\d{3,4}p)',
-        r'(4K)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text + " " + filename, re.IGNORECASE)
-        if match:
-            return match.group(1)
+    match = re.search(r'(\d{3,4}p)', combined, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    
+    match = re.search(r'(4K)', combined, re.IGNORECASE)
+    if match:
+        return '4K'
+    
+    if '1080' in combined:
+        return '1080p'
+    elif '720' in combined:
+        return '720p'
+    elif '480' in combined:
+        return '480p'
     
     return "1080p"
 
 def detect_audio(text):
     """Detect audio language"""
-    if 'hindi' in text.lower():
+    text_lower = text.lower()
+    if 'hindi' in text_lower:
         return 'Hindi Dub 🎙️ | Official'
-    elif 'english' in text.lower():
+    elif 'english' in text_lower:
         return 'English Dub'
-    elif 'japanese' in text.lower():
+    elif 'japanese' in text_lower:
         return 'Japanese'
+    elif 'tamil' in text_lower:
+        return 'Tamil'
+    elif 'telugu' in text_lower:
+        return 'Telugu'
     return 'Hindi Dub 🎙️ | Official'
 
 def get_quality_priority(quality):
     """For sorting - higher number = higher quality"""
     quality_map = {
-        '360p': 1, '480p': 2, '720p': 3, 
-        '1080p': 4, '4K': 5, '2160p': 6
+        '360p': 1, 
+        '480p': 2, 
+        '720p': 3, 
+        '1080p': 4, 
+        '4K': 5, 
+        '2160p': 6
     }
     return quality_map.get(quality, 4)
 
-# ============== COMMANDS ==============
+# ============== BOT INITIALIZATION ==============
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+app = Client(
+    "video_cover_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    parse_mode="html"  # HTML parse mode for blockquote
+)
+
+# ============== COMMAND HANDLERS ==============
+
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message: Message):
     """Start command"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ You are not authorized!")
+    if not is_admin(message.from_user.id):
+        await message.reply("❌ You are not authorized to use this bot!")
         return
     
-    await update.message.reply_text(
-        "<blockquote>Jinda hu abhi..</blockquote>",
-        parse_mode=ParseMode.HTML
-    )
+    await message.reply("<blockquote>Jinda hu abhi..</blockquote>")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@app.on_message(filters.command("help") & filters.private)
+async def help_command(client, message: Message):
     """Help command"""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(message.from_user.id):
         return
     
-    await update.message.reply_text("""🤖 **Commands:**
+    help_text = """🤖 <b>Bot Commands:</b>
 
-/start - Bot start
-/help - Ye message
-/setcaption - Caption template set karo
-/done - Videos bhejna band, cover manga
+<code>/start</code> - Bot start karo
+<code>/help</code> - Ye help message
+<code>/setcaption</code> - Custom caption template set karo
+<code>/done</code> - Videos bhejna band, cover manga
+<code>/cancel</code> - Sab cancel karo
 
-**Placeholders:**
-{anime_name} - Anime ka naam
-{ep} - Episode number (01, 02)
-{season} - Season number (01, 02)  
-{quality} - Quality (480p, 720p, 1080p, 4K)
-{audio} - Audio (Hindi Dub 🎙️ | Official)
+<b>Placeholders:</b>
+<code>{anime_name}</code> - Anime ka naam
+<code>{ep}</code> - Episode number (01, 02)
+<code>{season}</code> - Season number (01, 02)  
+<code>{quality}</code> - Quality (480p, 720p, 1080p, 4K)
+<code>{audio}</code> - Audio (Hindi Dub 🎙️ | Official)
 
-**Default Caption:**
-""" + DEFAULT_CAPTION, parse_mode=ParseMode.MARKDOWN)
+<b>Default Caption:</b>
+<blockquote expandable>""" + DEFAULT_CAPTION + """</blockquote>
 
-async def setcaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+<b>Kaam ka tareeka:</b>
+1. Multiple videos select karke bhejo
+2. Bot auto-detect karega (anime name, ep, quality)
+3. Ek cover photo bhejo
+4. Bot sab videos ko:
+   - Naya caption laga ke
+   - Cover change karke
+   - Episode wise sort karke (480p→720p→1080p→4K)
+   - Alag alag bhej dega!"""
+    
+    await message.reply(help_text)
+
+@app.on_message(filters.command("setcaption") & filters.private)
+async def setcaption_command(client, message: Message):
     """Set custom caption template"""
-    if not is_admin(update.effective_user.id):
+    if not is_admin(message.from_user.id):
         return
     
     # Get caption from message
-    if not context.args:
-        await update.message.reply_text(
+    if len(message.command) < 2:
+        await message.reply(
             "❌ Caption template bhejo!\n\n"
-            "Example:\n"
-            "/setcaption <b>{anime_name}</b>\n"
-            "Episode: {ep}\n"
-            "Quality: {quality}"
+            "<b>Example:</b>\n"
+            "<code>/setcaption &lt;blockquote expandable&gt;💫 {anime_name} 💫&lt;/blockquote&gt;\nEpisode: {ep}</code>\n\n"
+            "<b>Available placeholders:</b>\n"
+            "<code>{anime_name}, {ep}, {season}, {quality}, {audio}</code>"
         )
         return
     
-    caption = " ".join(context.args)
-    user_caption_template[update.effective_user.id] = caption
+    caption = message.text.split(None, 1)[1]
+    user_caption_template[message.from_user.id] = caption
     
-    await update.message.reply_text(
-        "✅ Caption template saved!\n\n"
-        "Preview:\n" + caption.replace('{anime_name}', 'Test Anime')
-                         .replace('{ep}', '01')
-                         .replace('{season}', '01')
-                         .replace('{quality}', '1080p')
-                         .replace('{audio}', 'Hindi Dub 🎙️ | Official'),
-        parse_mode=ParseMode.HTML
+    # Show preview
+    preview = caption.format(
+        anime_name="Demon Slayer",
+        ep="05",
+        season="01",
+        quality="1080p",
+        audio="Hindi Dub 🎙️ | Official"
     )
+    
+    await message.reply(f"✅ <b>Caption template saved!</b>\n\n<b>Preview:</b>\n{preview}")
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(client, message: Message):
+    """Cancel and clear queue"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    user_id = message.from_user.id
+    count = 0
+    
+    if user_id in pending_videos:
+        count = len(pending_videos[user_id])
+        del pending_videos[user_id]
+    
+    await message.reply(f"❌ <b>Cancelled!</b> {count} videos cleared from queue.")
+
+@app.on_message(filters.command("done") & filters.private)
+async def done_command(client, message: Message):
+    """Done collecting videos - ask for cover"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    user_id = message.from_user.id
+    
+    if user_id not in pending_videos or len(pending_videos[user_id]) == 0:
+        await message.reply("❌ Koi videos nahi hain! Pehle videos bhejo.")
+        return
+    
+    videos = pending_videos[user_id]
+    total = len(videos)
+    
+    # Show detected info
+    info_text = f"🎬 <b>{total} videos detected:</b>\n\n"
+    
+    for v in videos[:10]:
+        info_text += f"#{v['index']}: <code>{v['anime_name']}</code> | Ep{v['ep']} | {v['quality']}\n"
+    
+    if len(videos) > 10:
+        info_text += f"... aur {len(videos) - 10} videos\n"
+    
+    info_text += f"\n📸 <b>Ab ek cover photo bhejo!</b>\nSab videos par yahi cover lagega."
+    
+    await message.reply(info_text)
 
 # ============== VIDEO HANDLING ==============
 
-async def handle_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle multiple videos"""
-    if not is_admin(update.effective_user.id):
+@app.on_message(filters.video & filters.private)
+async def handle_videos(client, message: Message):
+    """Handle videos - add to queue"""
+    if not is_admin(message.from_user.id):
         return
     
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     
     if user_id not in pending_videos:
         pending_videos[user_id] = []
-        context.user_data['collecting'] = True
     
-    # Handle media group
-    if update.message.media_group_id:
-        if context.user_data.get('current_group') != update.message.media_group_id:
-            context.user_data['current_group'] = update.message.media_group_id
-            context.user_data['group_count'] = 0
-        
-        if update.message.video:
-            video = update.message.video
-            caption = update.message.caption if update.message.caption else ""
-            filename = video.file_name if video.file_name else ""
-            
-            # Extract data
-            video_data = {
-                'index': len(pending_videos[user_id]) + 1,
-                'video_file_id': video.file_id,
-                'caption': caption,
-                'caption_entities': update.message.caption_entities if update.message.caption_entities else [],
-                'filename': filename,
-                'anime_name': detect_anime_name(caption, filename),
-                'ep': detect_episode(caption, filename),
-                'season': detect_season(caption, filename),
-                'quality': detect_quality(caption, filename),
-                'audio': detect_audio(caption),
-                'width': video.width,
-                'height': video.height,
-                'duration': video.duration,
-                'supports_streaming': getattr(video, 'supports_streaming', True),
-                'has_spoiler': getattr(video, 'has_spoiler', False)
-            }
-            pending_videos[user_id].append(video_data)
-            context.user_data['group_count'] += 1
-        
-        return COLLECTING_VIDEOS
+    video = message.video
+    caption = message.caption or ""
+    filename = video.file_name or ""
     
-    # Single video
-    if update.message.video:
-        video = update.message.video
-        caption = update.message.caption if update.message.caption else ""
-        filename = video.file_name if video.file_name else ""
-        
-        video_data = {
-            'index': len(pending_videos[user_id]) + 1,
-            'video_file_id': video.file_id,
-            'caption': caption,
-            'caption_entities': update.message.caption_entities if update.message.caption_entities else [],
-            'filename': filename,
-            'anime_name': detect_anime_name(caption, filename),
-            'ep': detect_episode(caption, filename),
-            'season': detect_season(caption, filename),
-            'quality': detect_quality(caption, filename),
-            'audio': detect_audio(caption),
-            'width': video.width,
-            'height': video.height,
-            'duration': video.duration,
-            'supports_streaming': getattr(video, 'supports_streaming', True),
-            'has_spoiler': getattr(video, 'has_spoiler', False)
-        }
-        pending_videos[user_id].append(video_data)
-        
-        total = len(pending_videos[user_id])
-        
-        if context.user_data.get('group_count', 0) > 1:
-            count = context.user_data['group_count']
-            await update.message.reply_text(f"✅ {count} videos added! Total: {total}")
-            context.user_data['group_count'] = 0
-            context.user_data.pop('current_group', None)
-        else:
-            await update.message.reply_text(f"✅ Video #{total} added! Total: {total}")
-        
-        return COLLECTING_VIDEOS
+    # Extract all data
+    video_data = {
+        'index': len(pending_videos[user_id]) + 1,
+        'video_file_id': video.file_id,
+        'original_caption': caption,
+        'filename': filename,
+        'anime_name': detect_anime_name(caption, filename),
+        'ep': detect_episode(caption, filename),
+        'season': detect_season(caption, filename),
+        'quality': detect_quality(caption, filename),
+        'audio': detect_audio(caption),
+        'width': video.width,
+        'height': video.height,
+        'duration': video.duration,
+        'supports_streaming': getattr(video, 'supports_streaming', True),
+        'has_spoiler': getattr(video, 'has_spoiler', False)
+    }
     
-    return COLLECTING_VIDEOS
-
-async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Done collecting videos"""
-    if not is_admin(update.effective_user.id):
-        return
-    
-    user_id = update.effective_user.id
-    
-    if user_id not in pending_videos or len(pending_videos[user_id]) == 0:
-        await update.message.reply_text("❌ Koi videos nahi!")
-        return ConversationHandler.END
-    
+    pending_videos[user_id].append(video_data)
     total = len(pending_videos[user_id])
     
-    # Show detected info
-    videos = pending_videos[user_id]
-    info_text = f"🎬 **{total} videos detected:**\n\n"
-    
-    for v in videos[:5]:  # Show first 5
-        info_text += f"#{v['index']}: {v['anime_name']} Ep{v['ep']} {v['quality']}\n"
-    
-    if len(videos) > 5:
-        info_text += f"... aur {len(videos) - 5} videos\n"
-    
-    info_text += f"\n📸 **Ab ek cover bhejo!**"
-    
-    await update.message.reply_text(info_text)
-    return WAITING_FOR_COVER
+    # Reply every 5 videos or if less than 5 total
+    if total <= 5 or total % 5 == 0:
+        await message.reply(
+            f"✅ <b>{total} videos in queue!</b>\n"
+            f"📸 Ab ek cover bhejo ya aur videos bhejo..."
+        )
 
-async def handle_cover(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle cover and process all videos"""
-    if not is_admin(update.effective_user.id):
+@app.on_message(filters.photo & filters.private)
+async def handle_cover(client, message: Message):
+    """Handle cover photo and process all videos"""
+    if not is_admin(message.from_user.id):
         return
     
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     
     if user_id not in pending_videos or len(pending_videos[user_id]) == 0:
-        await update.message.reply_text("❌ Pehle videos bhejo!")
-        return COLLECTING_VIDEOS
+        # Maybe user just sent a photo, not a cover
+        return
     
-    if not update.message.photo:
-        await update.message.reply_text("❌ Photo bhejo cover ke liye!")
-        return WAITING_FOR_COVER
+    # Get cover file id (highest quality)
+    cover_file_id = message.photo.file_id
     
-    cover_file_id = update.message.photo[-1].file_id
     videos = pending_videos[user_id]
-    
-    # Get user's caption template or default
     caption_template = user_caption_template.get(user_id, DEFAULT_CAPTION)
     
-    # Sort videos: First by Episode, then by Quality (480p→720p→1080p→4K)
+    # Sort: Episode first, then Quality
     videos.sort(key=lambda x: (int(x['ep']), get_quality_priority(x['quality'])))
     
     total = len(videos)
-    await update.message.reply_text(f"⚡ Processing {total} videos...\nSorting: Episode wise → Quality wise")
     
-    # Send videos one by one with new caption and cover
+    # Send processing message
+    status_msg = await message.reply(
+        f"⚡ <b>Processing {total} videos...</b>\n"
+        f"🔄 Sorting: Episode wise → Quality wise\n"
+        f"⏳ Please wait..."
+    )
+    
+    # Process and send videos one by one
     sent = 0
-    for video_data in videos:
+    failed = 0
+    
+    for i, video_data in enumerate(videos, 1):
         try:
             # Generate new caption
             new_caption = caption_template.format(
@@ -370,88 +403,83 @@ async def handle_cover(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             # Send video with new caption and cover
-            await context.bot.send_video(
-                chat_id=update.effective_chat.id,
+            await client.send_video(
+                chat_id=message.chat.id,
                 video=video_data['video_file_id'],
                 caption=new_caption,
-                parse_mode=ParseMode.HTML,
                 duration=video_data['duration'],
                 width=video_data['width'],
                 height=video_data['height'],
-                thumbnail=cover_file_id,
-                cover=cover_file_id,
+                thumb=cover_file_id,  # Thumbnail
                 supports_streaming=video_data['supports_streaming'],
                 has_spoiler=video_data['has_spoiler']
             )
             sent += 1
             
-            # Small delay
-            await asyncio.sleep(0.2)
+            # Update status every 5 videos
+            if i % 5 == 0 and i < total:
+                try:
+                    await status_msg.edit_text(
+                        f"⚡ <b>Processing...</b> {i}/{total} done\n"
+                        f"⏳ Please wait..."
+                    )
+                except:
+                    pass
+            
+            # Delay to avoid flood
+            await asyncio.sleep(0.5)
             
         except Exception as e:
             logger.error(f"Error sending video {video_data['index']}: {e}")
-            await update.message.reply_text(f"❌ Video #{video_data['index']} failed!")
+            failed += 1
+            continue
+    
+    # Delete status message
+    try:
+        await status_msg.delete()
+    except:
+        pass
+    
+    # Final message
+    if failed > 0:
+        await message.reply(
+            f"⚠️ <b>Completed with {failed} errors!</b>\n"
+            f"✅ Sent: {sent}\n"
+            f"❌ Failed: {failed}\n"
+            f"📝 Captions changed\n"
+            f"🎬 Covers applied\n"
+            f"📊 Sorted: Episode → Quality"
+        )
+    else:
+        await message.reply(
+            f"✅ <b>All {sent} videos sent!</b>\n"
+            f"📝 New captions applied with blockquote\n"
+            f"🎬 Covers changed\n"
+            f"📊 Sorted: Episode → Quality (480p→720p→1080p→4K)\n\n"
+            f"🔄 /start for new batch"
+        )
     
     # Cleanup
     del pending_videos[user_id]
-    context.user_data.clear()
-    
-    # Success message
-    await update.message.reply_text(
-        f"✅ **{sent}/{total} videos sent!**\n"
-        f"📝 New captions applied\n"
-        f"🎬 Covers changed\n"
-        f"📊 Sorted: Episode → Quality (480p→720p→1080p→4K)\n\n"
-        f"🔄 /start for new batch"
-    )
-    
-    return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel"""
-    if not is_admin(update.effective_user.id):
-        return
-    
-    user_id = update.effective_user.id
-    count = 0
-    
-    if user_id in pending_videos:
-        count = len(pending_videos[user_id])
-        del pending_videos[user_id]
-    
-    context.user_data.clear()
-    await update.message.reply_text(f"❌ {count} videos cancelled!")
+# ============== MAIN ==============
 
-def main():
+if __name__ == "__main__":
     if not BOT_TOKEN:
-        logger.error("No BOT_TOKEN!")
-        return
+        logger.error("❌ BOT_TOKEN not found!")
+        exit(1)
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not API_ID or API_ID == 12345:
+        logger.error("❌ API_ID not configured!")
+        exit(1)
     
-    # Conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.VIDEO, handle_videos)],
-        states={
-            COLLECTING_VIDEOS: [
-                MessageHandler(filters.VIDEO, handle_videos),
-                MessageHandler(filters.PHOTO, handle_cover),
-                CommandHandler('done', done_command),
-            ],
-            WAITING_FOR_COVER: [
-                MessageHandler(filters.PHOTO, handle_cover),
-            ]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-    )
+    if not API_HASH or API_HASH == "your_api_hash":
+        logger.error("❌ API_HASH not configured!")
+        exit(1)
     
-    # Commands
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("setcaption", setcaption_command))
-    application.add_handler(conv_handler)
+    if not ADMIN_IDS or ADMIN_IDS == [123456789]:
+        logger.error("❌ ADMIN_IDS not configured! Apna Telegram ID daalo.")
+        exit(1)
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+    logger.info("🤖 Bot starting with Pyrofork...")
+    app.run()
