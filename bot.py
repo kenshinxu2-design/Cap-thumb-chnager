@@ -3,7 +3,8 @@ import logging
 import asyncio
 import re
 from pyrogram import Client, filters
-from pyrogram.types import Message, InputMediaVideo
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
 # ============== CONFIGURATION ==============
 
@@ -14,14 +15,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot Config
-API_ID = int(os.getenv("API_ID", "12345"))  # my.telegram.org se
-API_HASH = os.getenv("API_HASH", "your_api_hash")  # my.telegram.org se
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # BotFather se
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Admin IDs - YAHAN APNA ID DAALO
-ADMIN_IDS = [6728678197]  # <-- Apna Telegram ID yahan daalo
+# Admin IDs - TERA ID YAHAN HAI
+ADMIN_IDS = [6728678197]  # <-- Tera ID
 
-# Default caption template (blockquote ke saath)
+# Default caption template
 DEFAULT_CAPTION = """<blockquote expandable>💫 {anime_name} 💫</blockquote>
 <b>‣ Episode :</b> <code>{ep}</code>
 <b>‣ Season :</b> <code>{season}</code>
@@ -32,7 +33,7 @@ DEFAULT_CAPTION = """<blockquote expandable>💫 {anime_name} 💫</blockquote>
 🔰 @KENSHIN_ANIME</blockquote>"""
 
 # Storage
-pending_videos = {}  # user_id -> list of videos
+pending_videos = {}
 user_caption_template = {}
 
 # ============== HELPER FUNCTIONS ==============
@@ -187,8 +188,8 @@ app = Client(
     "video_cover_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    parse_mode="html"  # HTML parse mode for blockquote
+    bot_token=BOT_TOKEN
+    # parse_mode hataya - ab har message mein manually set karenge
 )
 
 # ============== COMMAND HANDLERS ==============
@@ -200,7 +201,10 @@ async def start(client, message: Message):
         await message.reply("❌ You are not authorized to use this bot!")
         return
     
-    await message.reply("<blockquote>Jinda hu abhi..</blockquote>")
+    await message.reply(
+        "<blockquote>Jinda hu abhi..</blockquote>",
+        parse_mode=ParseMode.HTML
+    )
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_command(client, message: Message):
@@ -236,7 +240,7 @@ async def help_command(client, message: Message):
    - Episode wise sort karke (480p→720p→1080p→4K)
    - Alag alag bhej dega!"""
     
-    await message.reply(help_text)
+    await message.reply(help_text, parse_mode=ParseMode.HTML)
 
 @app.on_message(filters.command("setcaption") & filters.private)
 async def setcaption_command(client, message: Message):
@@ -251,7 +255,8 @@ async def setcaption_command(client, message: Message):
             "<b>Example:</b>\n"
             "<code>/setcaption &lt;blockquote expandable&gt;💫 {anime_name} 💫&lt;/blockquote&gt;\nEpisode: {ep}</code>\n\n"
             "<b>Available placeholders:</b>\n"
-            "<code>{anime_name}, {ep}, {season}, {quality}, {audio}</code>"
+            "<code>{anime_name}, {ep}, {season}, {quality}, {audio}</code>",
+            parse_mode=ParseMode.HTML
         )
         return
     
@@ -267,7 +272,10 @@ async def setcaption_command(client, message: Message):
         audio="Hindi Dub 🎙️ | Official"
     )
     
-    await message.reply(f"✅ <b>Caption template saved!</b>\n\n<b>Preview:</b>\n{preview}")
+    await message.reply(
+        f"✅ <b>Caption template saved!</b>\n\n<b>Preview:</b>\n{preview}",
+        parse_mode=ParseMode.HTML
+    )
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_command(client, message: Message):
@@ -282,7 +290,10 @@ async def cancel_command(client, message: Message):
         count = len(pending_videos[user_id])
         del pending_videos[user_id]
     
-    await message.reply(f"❌ <b>Cancelled!</b> {count} videos cleared from queue.")
+    await message.reply(
+        f"❌ <b>Cancelled!</b> {count} videos cleared from queue.",
+        parse_mode=ParseMode.HTML
+    )
 
 @app.on_message(filters.command("done") & filters.private)
 async def done_command(client, message: Message):
@@ -310,7 +321,7 @@ async def done_command(client, message: Message):
     
     info_text += f"\n📸 <b>Ab ek cover photo bhejo!</b>\nSab videos par yahi cover lagega."
     
-    await message.reply(info_text)
+    await message.reply(info_text, parse_mode=ParseMode.HTML)
 
 # ============== VIDEO HANDLING ==============
 
@@ -354,7 +365,8 @@ async def handle_videos(client, message: Message):
     if total <= 5 or total % 5 == 0:
         await message.reply(
             f"✅ <b>{total} videos in queue!</b>\n"
-            f"📸 Ab ek cover bhejo ya aur videos bhejo..."
+            f"📸 Ab ek cover bhejo ya aur videos bhejo...",
+            parse_mode=ParseMode.HTML
         )
 
 @app.on_message(filters.photo & filters.private)
@@ -384,7 +396,8 @@ async def handle_cover(client, message: Message):
     status_msg = await message.reply(
         f"⚡ <b>Processing {total} videos...</b>\n"
         f"🔄 Sorting: Episode wise → Quality wise\n"
-        f"⏳ Please wait..."
+        f"⏳ Please wait...",
+        parse_mode=ParseMode.HTML
     )
     
     # Process and send videos one by one
@@ -407,6 +420,7 @@ async def handle_cover(client, message: Message):
                 chat_id=message.chat.id,
                 video=video_data['video_file_id'],
                 caption=new_caption,
+                parse_mode=ParseMode.HTML,  # HTML parse mode for blockquote
                 duration=video_data['duration'],
                 width=video_data['width'],
                 height=video_data['height'],
@@ -421,7 +435,8 @@ async def handle_cover(client, message: Message):
                 try:
                     await status_msg.edit_text(
                         f"⚡ <b>Processing...</b> {i}/{total} done\n"
-                        f"⏳ Please wait..."
+                        f"⏳ Please wait...",
+                        parse_mode=ParseMode.HTML
                     )
                 except:
                     pass
@@ -448,7 +463,8 @@ async def handle_cover(client, message: Message):
             f"❌ Failed: {failed}\n"
             f"📝 Captions changed\n"
             f"🎬 Covers applied\n"
-            f"📊 Sorted: Episode → Quality"
+            f"📊 Sorted: Episode → Quality",
+            parse_mode=ParseMode.HTML
         )
     else:
         await message.reply(
@@ -456,7 +472,8 @@ async def handle_cover(client, message: Message):
             f"📝 New captions applied with blockquote\n"
             f"🎬 Covers changed\n"
             f"📊 Sorted: Episode → Quality (480p→720p→1080p→4K)\n\n"
-            f"🔄 /start for new batch"
+            f"🔄 /start for new batch",
+            parse_mode=ParseMode.HTML
         )
     
     # Cleanup
@@ -466,20 +483,20 @@ async def handle_cover(client, message: Message):
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN not found!")
+        logger.error("❌ BOT_TOKEN not found! Environment variable set karo.")
         exit(1)
     
-    if not API_ID or API_ID == 12345:
-        logger.error("❌ API_ID not configured!")
+    if not API_ID or API_ID == 0:
+        logger.error("❌ API_ID not configured! my.telegram.org se lo.")
         exit(1)
     
-    if not API_HASH or API_HASH == "your_api_hash":
-        logger.error("❌ API_HASH not configured!")
+    if not API_HASH:
+        logger.error("❌ API_HASH not configured! my.telegram.org se lo.")
         exit(1)
     
-    if not ADMIN_IDS or ADMIN_IDS == [123456789]:
-        logger.error("❌ ADMIN_IDS not configured! Apna Telegram ID daalo.")
-        exit(1)
+    if not ADMIN_IDS or ADMIN_IDS == [6728678197]:
+        logger.warning("⚠️ ADMIN_IDS set hai, check karo sahi hai ya nahi.")
     
     logger.info("🤖 Bot starting with Pyrofork...")
+    logger.info(f"✅ Admin ID: {ADMIN_IDS[0]}")
     app.run()
