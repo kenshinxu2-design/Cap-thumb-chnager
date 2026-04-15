@@ -1,777 +1,1109 @@
-"""
-⚡ ULTIMATE FILE STORE BOT v3.0 ⚡
-✅ PyroFork (Anti-Blockquote)
-✅ Queue System
-✅ Multiple Start Images
-✅ Start Sticker
-✅ Full Admin Controls
-"""
+# ╔══════════════════════════════════════════════════════════════╗
+# ║          KENSHIN FILE NEXUS — FILE STORE BOT                ║
+# ║          by @KENSHIN_ANIME  |  Powered by Pyrofork          ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import random
-import string
-from datetime import datetime
-from typing import List
+import time
 
-from pyrogram import Client, filters, enums
-from pyrogram.errors import UserNotParticipant, FloodWait
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+from pyrogram import Client, filters, idle
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from pyrogram.errors import FloodWait, UserNotParticipant
 
-# ============== CONFIG ==============
-class Config:
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-    API_ID = int(os.environ.get("API_ID", "0"))
-    API_HASH = os.environ.get("API_HASH", "")
-    MONGO_URI = os.environ.get("MONGO_URI", "")
-    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-    PRIVATE_CHANNEL = int(os.environ.get("PRIVATE_CHANNEL", "0"))
-    
-    BOT_USERNAME = None
-    START_IMAGES = []
-    START_MESSAGES = []
-    FORCE_SUB_CHANNELS = []
-    ADMINS = []
-    START_STICKERS = []
+from config import Config
 
-config = Config()
+# ── Logging ───────────────────────────────────────────────────────────────────
 
-# ============== LOGGING ==============
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("KenshinNexus")
 
-# ============== DATABASE ==============
-class Database:
-    def __init__(self):
-        self.client = MongoClient(config.MONGO_URI)
-        self.db = self.client.ultimate_filestore
-        
-        self.files = self.db.files
-        self.users = self.db.users
-        self.banned = self.db.banned
-        self.queue = self.db.queue
-        self.settings = self.db.settings
-        
-        self.files.create_index("link_id", unique=True)
-        self.users.create_index("user_id", unique=True)
-        self.banned.create_index("user_id", unique=True)
-        
-    async def add_file(self, link_id: str, msg_ids: List[int], file_type: str, user_id: int, caption: str = "", protect: bool = False):
+# ── Pyrogram Client ───────────────────────────────────────────────────────────
+
+app = Client(
+    "kenshin_nexus",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE  (JSON — lightweight, no external dependency)
+# ══════════════════════════════════════════════════════════════════════════════
+
+DB_FILE = "data.json"
+
+def _default_db() -> dict:
+    return {
+        "admins": [Config.OWNER_ID],
+        "fsub_channels": [],          # [{id, name, type}]
+        "start_images": [],           # [file_id, ...]
+        "start_message": "",
+        "start_sticker": "",
+        "users": [],
+        "total_links": 0,
+        "auto_delete_time": Config.AUTO_DELETE_TIME,
+    }
+
+def load_db() -> dict:
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    db = _default_db()
+    save_db(db)
+    return db
+
+def save_db(data: dict):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# In-memory batch sessions  {user_id: [stored_msg_ids]}
+batch_sessions: dict[int, list[int]] = {}
+
+
+def encode(s: str) -> str:
+    """Base64-URL encode a string (no padding)."""
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+
+def decode(s: str) -> str:
+    """Decode a Base64-URL string (re-add padding)."""
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode()).decode()
+
+
+def is_admin(uid: int) -> bool:
+    db = load_db()
+    return uid == Config.OWNER_ID or uid in db.get("admins", [])
+
+
+async def auto_delete(client: Client, chat_id: int, msg_ids: list[int], delay: int):
+    """Delete messages after `delay` seconds."""
+    await asyncio.sleep(delay)
+    for mid in msg_ids:
         try:
-            self.files.insert_one({
-                "link_id": link_id, "msg_ids": msg_ids, "file_type": file_type,
-                "user_id": user_id, "caption": caption, "protect": protect,
-                "clicks": 0, "created_at": datetime.now()
-            })
-            return True
-        except DuplicateKeyError:
-            return False
-    
-    async def get_file(self, link_id: str):
-        return self.files.find_one({"link_id": link_id})
-    
-    async def delete_file(self, link_id: str):
-        return self.files.delete_one({"link_id": link_id}).deleted_count > 0
-    
-    async def increment_clicks(self, link_id: str):
-        self.files.update_one({"link_id": link_id}, {"$inc": {"clicks": 1}})
-    
-    async def add_to_queue(self, user_id: int, file_data: dict):
-        self.queue.insert_one({
-            "user_id": user_id, "file_id": file_data.get("file_id"),
-            "file_type": file_data.get("type"), "caption": file_data.get("caption"),
-            "added_at": datetime.now()
-        })
-    
-    async def get_user_queue(self, user_id: int):
-        return list(self.queue.find({"user_id": user_id}).sort("added_at", ASCENDING))
-    
-    async def clear_queue(self, user_id: int):
-        self.queue.delete_many({"user_id": user_id})
-    
-    async def get_queue_count(self, user_id: int):
-        return self.queue.count_documents({"user_id": user_id})
-    
-    async def add_user(self, user_id: int, username: str, first_name: str):
-        try:
-            self.users.insert_one({
-                "user_id": user_id, "username": username, "first_name": first_name,
-                "joined": datetime.now(), "last_active": datetime.now()
-            })
-        except DuplicateKeyError:
-            self.users.update_one({"user_id": user_id}, {"$set": {"last_active": datetime.now(), "username": username}})
-    
-    async def ban_user(self, user_id: int, reason: str, banned_by: int):
-        try:
-            self.banned.insert_one({"user_id": user_id, "reason": reason, "banned_by": banned_by, "banned_at": datetime.now()})
-            return True
-        except DuplicateKeyError:
-            return False
-    
-    async def unban_user(self, user_id: int):
-        return self.banned.delete_one({"user_id": user_id}).deleted_count > 0
-    
-    async def is_banned(self, user_id: int):
-        return self.banned.find_one({"user_id": user_id}) is not None
-    
-    async def get_stats(self):
-        return {
-            "users": self.users.count_documents({}),
-            "files": self.files.count_documents({}),
-            "banned": self.banned.count_documents({}),
-            "queue": self.queue.count_documents({})
-        }
-    
-    async def get_all_users(self):
-        return list(self.users.find({}, {"user_id": 1}))
-    
-    async def load_settings(self):
-        settings = self.settings.find_one({"_id": "main"}) or {}
-        config.START_IMAGES = settings.get("start_images", [])
-        config.START_MESSAGES = settings.get("start_messages", ["👋 Welcome!"])
-        config.FORCE_SUB_CHANNELS = settings.get("force_sub_channels", [])
-        config.ADMINS = settings.get("admins", [config.OWNER_ID])
-        config.START_STICKERS = settings.get("start_stickers", [])
-    
-    async def save_settings(self):
-        self.settings.update_one(
-            {"_id": "main"},
-            {"$set": {
-                "start_images": config.START_IMAGES, "start_messages": config.START_MESSAGES,
-                "force_sub_channels": config.FORCE_SUB_CHANNELS, "admins": config.ADMINS,
-                "start_stickers": config.START_STICKERS
-            }}, upsert=True
-        )
-    
-    async def add_start_image(self, file_id: str):
-        if file_id not in config.START_IMAGES:
-            config.START_IMAGES.append(file_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def remove_start_image(self, file_id: str):
-        if file_id in config.START_IMAGES:
-            config.START_IMAGES.remove(file_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def add_start_message(self, text: str):
-        if text not in config.START_MESSAGES:
-            config.START_MESSAGES.append(text)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def add_sticker(self, file_id: str):
-        if file_id not in config.START_STICKERS:
-            config.START_STICKERS.append(file_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def add_force_sub(self, channel_id: int):
-        if channel_id not in config.FORCE_SUB_CHANNELS:
-            config.FORCE_SUB_CHANNELS.append(channel_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def remove_force_sub(self, channel_id: int):
-        if channel_id in config.FORCE_SUB_CHANNELS:
-            config.FORCE_SUB_CHANNELS.remove(channel_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def add_admin(self, user_id: int):
-        if user_id not in config.ADMINS:
-            config.ADMINS.append(user_id)
-            await self.save_settings()
-            return True
-        return False
-    
-    async def remove_admin(self, user_id: int):
-        if user_id in config.ADMINS and user_id != config.OWNER_ID:
-            config.ADMINS.remove(user_id)
-            await self.save_settings()
-            return True
-        return False
-
-db = Database()
-
-# ============== BOT ==============
-app = Client("ultimate_filestore", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN, workers=200, parse_mode=enums.ParseMode.HTML)
-
-# ============== HELPERS ==============
-def generate_link_id(length: int = 10) -> str:
-    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
-
-def is_admin(user_id: int) -> bool:
-    return user_id == config.OWNER_ID or user_id in config.ADMINS
-
-async def check_force_sub(bot: Client, user_id: int) -> bool:
-    if not config.FORCE_SUB_CHANNELS:
-        return True
-    for channel in config.FORCE_SUB_CHANNELS:
-        try:
-            member = await bot.get_chat_member(channel, user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except UserNotParticipant:
-            return False
+            await client.delete_messages(chat_id, mid)
         except Exception:
-            continue
-    return True
+            pass
 
-def get_force_sub_markup():
+
+async def get_fsub_violations(client: Client, user_id: int) -> list[dict]:
+    """Return list of channels the user has NOT joined."""
+    db = load_db()
+    violations = []
+    for ch in db.get("fsub_channels", []):
+        try:
+            member = await client.get_chat_member(ch["id"], user_id)
+            if member.status.value in ("left", "kicked", "banned"):
+                violations.append(ch)
+        except UserNotParticipant:
+            violations.append(ch)
+        except Exception as e:
+            logger.warning(f"FSub check error [{ch['id']}]: {e}")
+    return violations
+
+
+async def build_fsub_markup(
+    client: Client, violations: list[dict], encoded: str
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard with join buttons + verify button."""
     buttons = []
-    for i, ch in enumerate(config.FORCE_SUB_CHANNELS, 1):
-        buttons.append([InlineKeyboardButton(f"📢 Join Channel {i}", url=f"https://t.me/c/{str(ch)[4:]}" if str(ch).startswith('-100') else f"https://t.me/{ch}")])
-    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_sub")])
+    for ch in violations:
+        try:
+            if ch["type"] == "public":
+                chat = await client.get_chat(ch["id"])
+                url = f"https://t.me/{chat.username}"
+            elif ch["type"] == "private_request":
+                inv = await client.create_chat_invite_link(
+                    ch["id"], creates_join_request=True
+                )
+                url = inv.invite_link
+            else:  # private — normal invite link
+                inv = await client.create_chat_invite_link(ch["id"])
+                url = inv.invite_link
+            buttons.append([InlineKeyboardButton(f"📡  Join — {ch['name']}", url=url)])
+        except Exception as e:
+            logger.error(f"Button gen failed [{ch['id']}]: {e}")
+
+    buttons.append(
+        [InlineKeyboardButton("✅  I've Joined — Verify & Unlock", callback_data=f"verify_{encoded}")]
+    )
     return InlineKeyboardMarkup(buttons)
 
-async def delete_after(msg, seconds: int):
-    if seconds <= 0:
+
+async def deliver_files(client: Client, user_id: int, encoded: str):
+    """Decode link and deliver file(s) to user."""
+    db = load_db()
+    delete_time = db.get("auto_delete_time", Config.AUTO_DELETE_TIME)
+
+    try:
+        decoded = decode(encoded)
+    except Exception:
+        await client.send_message(user_id, "**❌ CORRUPTED LINK** — Payload invalid or tampered.")
         return
-    await asyncio.sleep(seconds)
+
+    sent_ids: list[int] = []
+
+    # ── Single file ──────────────────────────────────────────────────────────
+    if decoded.startswith("file_"):
+        mid = int(decoded.split("_", 1)[1])
+        try:
+            m = await client.copy_message(user_id, Config.DB_CHANNEL, mid)
+            sent_ids.append(m.id)
+        except Exception as e:
+            await client.send_message(user_id, f"**❌ RETRIEVAL FAILED:**\n`{e}`")
+            return
+
+    # ── Batch ────────────────────────────────────────────────────────────────
+    elif decoded.startswith("batch_"):
+        parts = decoded.split("_")   # ["batch", "start", "end"]
+        s_id, e_id = int(parts[1]), int(parts[2])
+        count = e_id - s_id + 1
+
+        notice = await client.send_message(
+            user_id,
+            f"**⚡ BATCH TRANSFER SEQUENCE**\n\n"
+            f"```\n"
+            f"[ MODE    : BATCH DELIVERY     ]\n"
+            f"[ FILES   : {count:<22}]\n"
+            f"[ STATUS  : TRANSMITTING...    ]\n"
+            f"```\n"
+            f"_Copying files from the nexus..._",
+        )
+        sent_ids.append(notice.id)
+
+        for mid in range(s_id, e_id + 1):
+            try:
+                m = await client.copy_message(user_id, Config.DB_CHANNEL, mid)
+                sent_ids.append(m.id)
+                await asyncio.sleep(0.3)
+            except Exception as ex:
+                logger.warning(f"Batch copy failed [{mid}]: {ex}")
+
+    else:
+        await client.send_message(user_id, "**❌ UNKNOWN LINK FORMAT.**")
+        return
+
+    # ── Auto-delete notice ───────────────────────────────────────────────────
+    if sent_ids and delete_time > 0:
+        mins, secs = divmod(delete_time, 60)
+        d = await client.send_message(
+            user_id,
+            f"**⏳ AUTO-PURGE SEQUENCE ACTIVE**\n\n"
+            f"🗑️ Files self-destruct in **{mins}m {secs}s**\n"
+            f"💾 _Download & save immediately before they vanish._",
+        )
+        sent_ids.append(d.id)
+        asyncio.create_task(auto_delete(client, user_id, sent_ids, delete_time))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMMAND HANDLERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /start ────────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(client: Client, message: Message):
+    db = load_db()
+    uid = message.from_user.id
+
+    # Register user
+    if uid not in db["users"]:
+        db["users"].append(uid)
+        save_db(db)
+
+    # ── Deep-link access ─────────────────────────────────────────────────────
+    if len(message.command) > 1:
+        encoded = message.command[1]
+        violations = await get_fsub_violations(client, uid)
+
+        if violations:
+            markup = await build_fsub_markup(client, violations, encoded)
+            await message.reply(
+                "**🔐 SECURITY PROTOCOL — ACCESS RESTRICTED**\n\n"
+                "```\n"
+                "[ CLEARANCE CHECK  : FAILED     ]\n"
+                "[ FILE ACCESS      : LOCKED     ]\n"
+                "[ ACTION REQUIRED  : JOIN BELOW ]\n"
+                "```\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ Subscribe to **ALL** channels below to unlock\n"
+                "your transmission from the KENSHIN FILE NEXUS.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                reply_markup=markup,
+            )
+            return
+
+        await deliver_files(client, uid, encoded)
+        return
+
+    # ── Normal /start — show greeting ────────────────────────────────────────
+    # 1. Sticker (auto-deletes after welcome)
+    sticker_msg = None
+    if db.get("start_sticker"):
+        try:
+            sticker_msg = await client.send_sticker(message.chat.id, db["start_sticker"])
+        except Exception:
+            pass
+
+    # 2. Welcome text
+    welcome = db.get("start_message") or (
+        "**⚡ KENSHIN FILE NEXUS — SYSTEM ONLINE ⚡**\n\n"
+        "```\n"
+        "╔══════════════════════════════╗\n"
+        "║   INITIALIZING SYSTEM...     ║\n"
+        "║   ENCRYPTION   :  ACTIVE  ✓  ║\n"
+        "║   STORAGE      :  SECURED ✓  ║\n"
+        "║   FORCE-SUB    :  ENABLED ✓  ║\n"
+        "║   STATUS       :  ONLINE  ✓  ║\n"
+        "╚══════════════════════════════╝\n"
+        "```\n\n"
+        "🌑 **Welcome to the Shadow Archive.**\n"
+        "Files stored here are encrypted, permanent,\n"
+        "and accessible only through verified access links.\n\n"
+        "🔗 Use `/help` to access the **Command Matrix**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ _Powered by Kenshin Anime_"
+    )
+
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📡 Kenshin Anime", url="https://t.me/KENSHIN_ANIME"),
+            InlineKeyboardButton("📚 Help", callback_data="cb_help"),
+        ],
+        [InlineKeyboardButton("⚙️ Command Matrix", callback_data="cb_cmds")],
+    ])
+
+    # 3. Send with random start image (if any)
+    images = db.get("start_images", [])
+    if images:
+        try:
+            await client.send_photo(
+                message.chat.id,
+                photo=random.choice(images),
+                caption=welcome,
+                reply_markup=buttons,
+            )
+        except Exception:
+            await message.reply(welcome, reply_markup=buttons)
+    else:
+        await message.reply(welcome, reply_markup=buttons)
+
+    # 4. Auto-delete sticker after 5 s
+    if sticker_msg:
+        asyncio.create_task(_delete_after(sticker_msg, 5))
+
+
+async def _delete_after(msg: Message, delay: int):
+    await asyncio.sleep(delay)
     try:
         await msg.delete()
-    except:
+    except Exception:
         pass
 
-# ============== START ==============
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(bot: Client, msg):
-    user_id = msg.from_user.id
-    
-    if not config.BOT_USERNAME:
-        me = await bot.get_me()
-        config.BOT_USERNAME = me.username
-        await db.load_settings()
-    
-    if await db.is_banned(user_id):
-        return await msg.reply("🚫 Banned!")
-    
-    await db.add_user(user_id, msg.from_user.username, msg.from_user.first_name)
-    
-    if not await check_force_sub(bot, user_id):
-        text = "⚠️ <b>Join Required Channels!</b>"
-        if config.START_IMAGES:
-            return await msg.reply_photo(photo=random.choice(config.START_IMAGES), caption=text, reply_markup=get_force_sub_markup())
-        return await msg.reply(text, reply_markup=get_force_sub_markup())
-    
-    if len(msg.command) > 1:
-        await send_stored_file(bot, msg, msg.command[1])
-        return
-    
-    # Sticker
-    sticker_msg = None
-    if config.START_STICKERS:
-        try:
-            sticker_msg = await bot.send_sticker(user_id, random.choice(config.START_STICKERS))
-        except:
-            pass
-    
-    # Start message
-    start_text = random.choice(config.START_MESSAGES) if config.START_MESSAGES else "👋 Welcome!"
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Updates", url="https://t.me/updates")],
-        [InlineKeyboardButton("❓ Help", callback_data="help"), InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
-    ])
-    
-    if config.START_IMAGES:
-        main_msg = await msg.reply_photo(photo=random.choice(config.START_IMAGES), caption=start_text, reply_markup=buttons)
-    else:
-        main_msg = await msg.reply(start_text, reply_markup=buttons)
-    
-    if sticker_msg:
-        asyncio.create_task(delete_after(sticker_msg, 3))
 
-@app.on_callback_query(filters.regex("check_sub"))
-async def check_sub_cb(bot: Client, query: CallbackQuery):
-    if await check_force_sub(bot, query.from_user.id):
-        await query.answer("✅ Verified!", show_alert=True)
-        await query.message.delete()
-        await start_cmd(bot, query.message)
-    else:
-        await query.answer("❌ Join all channels!", show_alert=True)
-
-# ============== FILE SENDING ==============
-async def send_stored_file(bot: Client, msg: Message, link_id: str):
-    user_id = msg.from_user.id
-    
-    if await db.is_banned(user_id):
-        return await msg.reply("🚫 Banned!")
-    
-    if not await check_force_sub(bot, user_id):
-        return await msg.reply("⚠️ Join channels!", reply_markup=get_force_sub_markup())
-    
-    file_data = await db.get_file(link_id)
-    if not file_data:
-        return await msg.reply("❌ Invalid link!")
-    
-    await db.increment_clicks(link_id)
-    msg_ids = file_data.get("msg_ids", [])
-    
-    if not msg_ids:
-        return await msg.reply("❌ File not found!")
-    
-    sent = []
-    for msg_id in msg_ids:
-        try:
-            copied = await bot.copy_message(chat_id=user_id, from_chat_id=config.PRIVATE_CHANNEL, message_id=msg_id)
-            sent.append(copied)
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            continue
-    
-    if sent:
-        await msg.reply(f"✅ Sent {len(sent)} file(s)!")
-    else:
-        await msg.reply("❌ Could not send files!")
-
-# ============== GENLINK ==============
-@app.on_message(filters.command("genlink") & filters.private)
-async def genlink_cmd(bot: Client, msg: Message):
-    user_id = msg.from_user.id
-    
-    if not msg.reply_to_message:
-        return await msg.reply("📎 Reply to a file with /genlink")
-    
-    reply = msg.reply_to_message
-    if not (reply.video or reply.document or reply.photo or reply.audio):
-        return await msg.reply("❌ No file found!")
-    
-    processing = await msg.reply("⏳ Processing...")
-    
-    try:
-        forwarded = await reply.forward(config.PRIVATE_CHANNEL)
-        link_id = generate_link_id()
-        await db.add_file(link_id, [forwarded.message_id], "single", user_id, reply.caption)
-        
-        link = f"https://t.me/{config.BOT_USERNAME}?start={link_id}"
-        
-        await processing.edit_text(
-            f"✅ <b>Link Generated!</b>\n\n🔗 <code>{link}</code>\n\n📊 Type: Single File",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Open", url=link)],
-                [InlineKeyboardButton("📤 Share", url=f"https://t.me/share/url?url={link}")]
-            ])
-        )
-    except Exception as e:
-        await processing.edit_text(f"❌ Error: {e}")
-
-# ============== QUEUE SYSTEM ==============
-@app.on_message((filters.video | filters.document | filters.photo | filters.audio) & filters.private)
-async def add_to_queue_handler(bot: Client, msg: Message):
-    user_id = msg.from_user.id
-    
-    if not is_admin(user_id):
-        return
-    
-    if not await check_force_sub(bot, user_id):
-        return
-    
-    file_type = "document"
-    if msg.video:
-        file_type = "video"
-    elif msg.photo:
-        file_type = "photo"
-    elif msg.audio:
-        file_type = "audio"
-    
-    await db.add_to_queue(user_id, {"file_id": msg.id, "type": file_type, "caption": msg.caption or ""})
-    count = await db.get_queue_count(user_id)
-    
-    asyncio.create_task(delete_after(msg, 2))
-    confirm = await msg.reply(f"📥 Added! Total: {count}")
-    asyncio.create_task(delete_after(confirm, 3))
-
-@app.on_message(filters.command("process") & filters.private)
-async def process_queue(bot: Client, msg: Message):
-    user_id = msg.from_user.id
-    
-    if not is_admin(user_id):
-        return await msg.reply("⚠️ Admins only!")
-    
-    queue_items = await db.get_user_queue(user_id)
-    if not queue_items:
-        return await msg.reply("📭 Queue empty!")
-    
-    if len(queue_items) < 2:
-        return await msg.reply("⚠️ Need 2+ files!")
-    
-    processing = await msg.reply(f"⏳ Processing {len(queue_items)} files...")
-    
-    try:
-        msg_ids = []
-        for item in queue_items:
-            try:
-                forwarded = await bot.copy_message(chat_id=config.PRIVATE_CHANNEL, from_chat_id=user_id, message_id=item.get("file_id", 0))
-                if forwarded:
-                    msg_ids.append(forwarded.message_id)
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"Queue process error: {e}")
-                continue
-        
-        if not msg_ids:
-            return await processing.edit_text("❌ No files processed!")
-        
-        batch_id = generate_link_id(12)
-        await db.add_file(batch_id, msg_ids, "batch", user_id, f"Batch of {len(msg_ids)} files", protect=True)
-        await db.clear_queue(user_id)
-        
-        link = f"https://t.me/{config.BOT_USERNAME}?start={batch_id}"
-        
-        await processing.edit_text(
-            f"✅ <b>Batch Created!</b>\n\n📊 Files: {len(msg_ids)}\n🔗 <code>{link}</code>",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Batch", url=link)]])
-        )
-    except Exception as e:
-        await processing.edit_text(f"❌ Error: {e}")
-
-@app.on_message(filters.command("clearqueue") & filters.private)
-async def clear_queue_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    await db.clear_queue(msg.from_user.id)
-    await msg.reply("✅ Queue cleared!")
-
-@app.on_message(filters.command("queue") & filters.private)
-async def show_queue(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    count = await db.get_queue_count(msg.from_user.id)
-    await msg.reply(f"📥 Queue: {count} files\n\nUse /process to create batch")
-
-# ============== ADMIN COMMANDS ==============
-@app.on_message(filters.command("set_start_img") & filters.private)
-async def set_start_img(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.reply("⚠️ Owner only!")
-    
-    if not msg.reply_to_message or not msg.reply_to_message.photo:
-        return await msg.reply("📷 Reply to a photo!")
-    
-    file_id = msg.reply_to_message.photo.file_id
-    
-    if await db.add_start_image(file_id):
-        await msg.reply(f"✅ Added! Total: {len(config.START_IMAGES)}")
-    else:
-        await msg.reply("⚠️ Already exists!")
-
-@app.on_message(filters.command("del_start_img") & filters.private)
-async def del_start_img(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /del_start_img [file_id]")
-    
-    if await db.remove_start_image(msg.command[1]):
-        await msg.reply("✅ Removed!")
-    else:
-        await msg.reply("❌ Not found!")
-
-@app.on_message(filters.command("list_start_img") & filters.private)
-async def list_start_img(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if not config.START_IMAGES:
-        return await msg.reply("📭 No images!")
-    
-    text = f"📷 <b>Images ({len(config.START_IMAGES)}):</b>\n\n"
-    for i, img in enumerate(config.START_IMAGES, 1):
-        text += f"{i}. <code>{img[:30]}...</code>\n"
-    
-    await msg.reply(text)
-
-@app.on_message(filters.command("set_start_msg") & filters.private)
-async def set_start_msg(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /set_start_msg [text]")
-    
-    text = " ".join(msg.command[1:])
-    
-    if await db.add_start_message(text):
-        await msg.reply(f"✅ Added! Total: {len(config.START_MESSAGES)}")
-    else:
-        await msg.reply("⚠️ Already exists!")
-
-@app.on_message(filters.command("add_sticker") & filters.private)
-async def add_sticker(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message or not msg.reply_to_message.sticker:
-        return await msg.reply("😊 Reply to a sticker!")
-    
-    if await db.add_sticker(msg.reply_to_message.sticker.file_id):
-        await msg.reply(f"✅ Added! Total: {len(config.START_STICKERS)}")
-    else:
-        await msg.reply("⚠️ Already exists!")
-
-@app.on_message(filters.command("set_force_sub") & filters.private)
-async def set_force_sub(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /set_force_sub [channel_id/username]")
-    
-    try:
-        chat = await bot.get_chat(msg.command[1])
-        if await db.add_force_sub(chat.id):
-            await msg.reply(f"✅ Added! Total: {len(config.FORCE_SUB_CHANNELS)}")
-        else:
-            await msg.reply("⚠️ Already exists!")
-    except Exception as e:
-        await msg.reply(f"❌ Error: {e}")
-
-@app.on_message(filters.command("del_force_sub") & filters.private)
-async def del_force_sub(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /del_force_sub [channel_id]")
-    
-    try:
-        channel_id = int(msg.command[1])
-        if await db.remove_force_sub(channel_id):
-            await msg.reply("✅ Removed!")
-        else:
-            await msg.reply("❌ Not found!")
-    except:
-        await msg.reply("❌ Invalid ID!")
-
-@app.on_message(filters.command("list_force_sub") & filters.private)
-async def list_force_sub(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if not config.FORCE_SUB_CHANNELS:
-        return await msg.reply("📭 No channels!")
-    
-    text = f"📢 <b>Channels ({len(config.FORCE_SUB_CHANNELS)}):</b>\n\n"
-    for i, ch in enumerate(config.FORCE_SUB_CHANNELS, 1):
-        text += f"{i}. <code>{ch}</code>\n"
-    
-    await msg.reply(text)
-
-@app.on_message(filters.command("add_admin") & filters.private)
-async def add_admin(bot: Client, msg: Message):
-    if msg.from_user.id != config.OWNER_ID:
-        return await msg.reply("🚫 Owner only!")
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /add_admin [user_id]")
-    
-    try:
-        user_id = int(msg.command[1])
-        if await db.add_admin(user_id):
-            await msg.reply(f"✅ Added admin: <code>{user_id}</code>")
-        else:
-            await msg.reply("⚠️ Already admin!")
-    except:
-        await msg.reply("❌ Invalid ID!")
-
-@app.on_message(filters.command("remove_admin") & filters.private)
-async def remove_admin(bot: Client, msg: Message):
-    if msg.from_user.id != config.OWNER_ID:
-        return await msg.reply("🚫 Owner only!")
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /remove_admin [user_id]")
-    
-    try:
-        user_id = int(msg.command[1])
-        if user_id == config.OWNER_ID:
-            return await msg.reply("❌ Cannot remove owner!")
-        
-        if await db.remove_admin(user_id):
-            await msg.reply(f"✅ Removed: <code>{user_id}</code>")
-        else:
-            await msg.reply("❌ Not found!")
-    except:
-        await msg.reply("❌ Invalid ID!")
-
-@app.on_message(filters.command("list_admins") & filters.private)
-async def list_admins(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    text = f"👑 <b>Owner:</b> <code>{config.OWNER_ID}</code>\n\n👥 <b>Admins ({len(config.ADMINS)}):</b>\n"
-    for admin in config.ADMINS:
-        text += f"• <code>{admin}</code> {'👑' if admin == config.OWNER_ID else ''}\n"
-    
-    await msg.reply(text)
-
-# ============== OTHER COMMANDS ==============
-@app.on_message(filters.command("genbatch") & filters.private)
-async def genbatch_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.reply("⚠️ Admins only!")
-    
-    if len(msg.command) < 4:
-        return await msg.reply("Usage: /genbatch [channel] [start_id] [end_id]")
-    
-    try:
-        channel = msg.command[1]
-        start_id = int(msg.command[2])
-        end_id = int(msg.command[3])
-        
-        if end_id - start_id > 200:
-            return await msg.reply("⚠️ Max 200!")
-        
-        processing = await msg.reply("⏳ Processing...")
-        
-        msg_ids = []
-        for msg_id in range(start_id, end_id + 1):
-            try:
-                copied = await bot.copy_message(chat_id=config.PRIVATE_CHANNEL, from_chat_id=channel, message_id=msg_id)
-                if copied:
-                    msg_ids.append(copied.message_id)
-                await asyncio.sleep(0.3)
-            except Exception as e:
-                logger.error(f"Batch error {msg_id}: {e}")
-                continue
-        
-        if not msg_ids:
-            return await processing.edit_text("❌ No files!")
-        
-        batch_id = generate_link_id(12)
-        await db.add_file(batch_id, msg_ids, "batch", msg.from_user.id, f"Batch of {len(msg_ids)} files")
-        
-        link = f"https://t.me/{config.BOT_USERNAME}?start={batch_id}"
-        
-        await processing.edit_text(f"✅ <b>Batch Created!</b>\n\n📊 Files: {len(msg_ids)}\n🔗 <code>{link}</code>")
-        
-    except Exception as e:
-        await msg.reply(f"❌ Error: {e}")
-
-@app.on_message(filters.command("broadcast") & filters.private)
-async def broadcast_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if not msg.reply_to_message:
-        return await msg.reply("Reply to a message!")
-    
-    reply = await msg.reply("⏳ Broadcasting...")
-    
-    users = await db.get_all_users()
-    success = failed = 0
-    
-    for user in users:
-        try:
-            await msg.reply_to_message.copy(user["user_id"])
-            success += 1
-            await asyncio.sleep(0.1)
-        except:
-            failed += 1
-    
-    await reply.edit_text(f"✅ Done!\n\nSuccess: {success}\nFailed: {failed}")
-
-@app.on_message(filters.command("ban") & filters.private)
-async def ban_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /ban [user_id] [reason]")
-    
-    try:
-        user_id = int(msg.command[1])
-        reason = " ".join(msg.command[2:]) if len(msg.command) > 2 else "No reason"
-        
-        if await db.ban_user(user_id, reason, msg.from_user.id):
-            await msg.reply(f"✅ Banned: <code>{user_id}</code>")
-        else:
-            await msg.reply("⚠️ Already banned!")
-    except:
-        await msg.reply("❌ Invalid ID!")
-
-@app.on_message(filters.command("unban") & filters.private)
-async def unban_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /unban [user_id]")
-    
-    try:
-        user_id = int(msg.command[1])
-        if await db.unban_user(user_id):
-            await msg.reply(f"✅ Unbanned: <code>{user_id}</code>")
-        else:
-            await msg.reply("❌ Not found!")
-    except:
-        await msg.reply("❌ Invalid ID!")
-
-@app.on_message(filters.command("stats") & filters.private)
-async def stats_cmd(bot: Client, msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    
-    stats = await db.get_stats()
-    await msg.reply(f"📊 <b>STATS</b>\n\n👥 Users: {stats['users']:,}\n📁 Files: {stats['files']:,}\n📥 Queue: {stats['queue']:,}\n🚫 Banned: {stats['banned']:,}")
+# ── /help ─────────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("help") & filters.private)
-async def help_cmd(bot: Client, msg: Message):
-    help_text = """
-<b>📚 COMMANDS</b>
+async def cmd_help(client: Client, message: Message):
+    await message.reply(
+        "**📡 KENSHIN FILE NEXUS — COMMAND MATRIX**\n\n"
+        "```\n"
+        "[ CENTRAL DATABASE  :  CONNECTED  ]\n"
+        "[ AUTHORIZATION     :  GRANTED    ]\n"
+        "[ LOADING REGISTRY  :  COMPLETE   ]\n"
+        "```\n\n"
+        "**━━━ 🌐 USER PROTOCOLS ━━━**\n"
+        "`/start` → Initialize the system protocol\n"
+        "`/help` → Display this central command manual\n"
+        "`/ping` → Check system latency & status\n"
+        "`/cancel` → Terminate the current operation\n\n"
+        "**━━━ 🔗 LINK GENERATION ━━━**\n"
+        "`/genlink` → Generate a singular encrypted file link\n"
+        "  ↳ _Reply to any file/media_\n"
+        "`/batch` → Initiate a multi-file batch sequence\n"
+        "  ↳ _Forward files one by one after this_\n"
+        "`/process` → Finalize batch & generate access key\n\n"
+        "**━━━ 🛡️ ADMIN MATRIX ━━━**\n"
+        "`/stats` → View global system analytics\n"
+        "`/broadcast` → Transmit a global frequency message\n"
+        "`/add_admin` → Authorize a new system administrator\n"
+        "`/del_admin` → Revoke administrative privileges\n\n"
+        "**━━━ 📡 SECURITY CHANNELS ━━━**\n"
+        "`/add_fsub` → Link a security requirement channel\n"
+        "`/del_fsub` → Remove a security requirement channel\n\n"
+        "**━━━ 🎨 INTERFACE CONFIG ━━━**\n"
+        "`/set_start` → Configure the primary greeting message\n"
+        "`/add_img` → Insert a visual asset into start rotation\n"
+        "`/del_imgs` → Wipe all visual assets from memory\n"
+        "`/set_sticker` → Set the system greeting signature\n"
+        "`/set_delete_time` → Configure auto-purge timer\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ _KENSHIN FILE NEXUS — Encrypted. Secured. Eternal._",
+    )
 
-<b>User:</b>
-/start - Start bot / Access files
-/help - This help
 
-<b>Admin:</b>
-/genlink - Store single file
-/genbatch - Store from channel
-/queue - View queue
-/process - Process queue
-/clearqueue - Clear queue
+# ── /ping ─────────────────────────────────────────────────────────────────────
 
-<b>Settings:</b>
-/set_start_img - Add start image
-/set_start_msg - Add message
-/add_sticker - Add sticker
-/set_force_sub - Add force sub
-/del_force_sub - Remove force sub
-/add_admin - Add admin
-/remove_admin - Remove admin
+@app.on_message(filters.command("ping") & filters.private)
+async def cmd_ping(client: Client, message: Message):
+    t = time.monotonic()
+    m = await message.reply("**⚡ Scanning core systems...**")
+    lat = (time.monotonic() - t) * 1000
+    await m.edit(
+        f"**🟢 SYSTEM STATUS — FULLY OPERATIONAL**\n\n"
+        f"```\n"
+        f"[ LATENCY    : {lat:.2f} ms            ]\n"
+        f"[ API STATUS : CONNECTED               ]\n"
+        f"[ ENCRYPTION : ACTIVE                  ]\n"
+        f"[ CORE NODE  : ONLINE                  ]\n"
+        f"[ UPTIME     : STABLE                  ]\n"
+        f"```\n\n"
+        f"⚡ _All systems nominal. Nexus is alive._",
+    )
 
-<b>Management:</b>
-/broadcast - Broadcast
-/ban /unban - User control
-/stats - Statistics
-"""
-    await msg.reply(help_text)
 
-@app.on_callback_query(filters.regex("help"))
-async def help_cb(bot: Client, query: CallbackQuery):
-    await help_cmd(bot, query.message)
+# ── /cancel ───────────────────────────────────────────────────────────────────
 
-@app.on_callback_query(filters.regex("settings"))
-async def settings_cb(bot: Client, query: CallbackQuery):
-    if not is_admin(query.from_user.id):
-        return await query.answer("Admins only!", show_alert=True)
-    
-    text = f"⚙️ <b>SETTINGS</b>\n\n📷 Images: {len(config.START_IMAGES)}\n💬 Messages: {len(config.START_MESSAGES)}\n😊 Stickers: {len(config.START_STICKERS)}\n📢 Force Subs: {len(config.FORCE_SUB_CHANNELS)}\n👥 Admins: {len(config.ADMINS)}"
-    await query.message.edit_text(text)
+@app.on_message(filters.command("cancel") & filters.private)
+async def cmd_cancel(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid in batch_sessions:
+        count = len(batch_sessions[uid])
+        del batch_sessions[uid]
+        await message.reply(
+            f"**🛑 OPERATION TERMINATED**\n\n"
+            f"```\n"
+            f"[ BATCH SESSION  : CLEARED    ]\n"
+            f"[ FILES IN QUEUE : {count:<10}]\n"
+            f"[ STATUS         : STANDBY    ]\n"
+            f"```\n"
+            f"_All queued data purged from memory. System on standby._",
+        )
+    else:
+        await message.reply(
+            "**⚠️ NO ACTIVE OPERATION**\n"
+            "_System is already in standby mode._\n"
+            "Start a batch session with `/batch` first.",
+        )
+
+
+# ── /genlink ──────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("genlink") & filters.private)
+async def cmd_genlink(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    target = message.reply_to_message
+    if not target:
+        return await message.reply(
+            "**⚠️ SYNTAX ERROR**\n\n"
+            "Reply to a **file/media/document** with `/genlink`.\n\n"
+            "**Steps:**\n"
+            "1️⃣ Send or forward a file to the bot\n"
+            "2️⃣ Reply to that file with `/genlink`\n"
+            "3️⃣ Get your shareable encrypted link ⚡",
+        )
+
+    proc = await message.reply("**⚙️ Encrypting payload — storing in nexus...**")
+
+    try:
+        fwd = await target.forward(Config.DB_CHANNEL)
+        link_str = encode(f"file_{fwd.id}")
+        me = await client.get_me()
+        link = f"https://t.me/{me.username}?start={link_str}"
+
+        db = load_db()
+        db["total_links"] += 1
+        save_db(db)
+
+        await proc.edit(
+            f"**🔗 ENCRYPTION COMPLETE — LINK FORGED**\n\n"
+            f"```\n"
+            f"[ STATUS     : SUCCESS              ]\n"
+            f"[ TYPE       : SINGLE FILE          ]\n"
+            f"[ MSG ID     : {fwd.id:<20}]\n"
+            f"[ ENCRYPTED  : BASE64-URL           ]\n"
+            f"```\n\n"
+            f"**🌐 Shareable Access Link:**\n"
+            f"`{link}`\n\n"
+            f"📋 _Tap the link above to copy. Share freely._\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ _KENSHIN FILE NEXUS_",
+        )
+    except Exception as e:
+        await proc.edit(f"**❌ OPERATION FAILED:**\n`{e}`")
+
+
+# ── /batch ────────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("batch") & filters.private)
+async def cmd_batch(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    uid = message.from_user.id
+    batch_sessions[uid] = []
+
+    await message.reply(
+        "**📦 BATCH SEQUENCE — INITIATED**\n\n"
+        "```\n"
+        "[ MODE      : CAPTURE ACTIVE     ]\n"
+        "[ QUEUE     : 0 FILES            ]\n"
+        "[ RECEIVER  : LISTENING...       ]\n"
+        "```\n\n"
+        "**📤 HOW TO USE:**\n"
+        "→ Forward or send files **one by one** to the bot\n"
+        "→ Each file gets queued into the nexus automatically\n"
+        "→ Send `/process` when **all files** are uploaded\n"
+        "→ Send `/cancel` to abort the operation\n\n"
+        "⚡ _Begin transmission now — the nexus is listening..._",
+    )
+
+
+# ── Batch file collector (media only) ─────────────────────────────────────────
+
+def _in_batch(_, __, msg: Message) -> bool:
+    return bool(msg.from_user and msg.from_user.id in batch_sessions)
+
+in_batch = filters.create(_in_batch)
+
+@app.on_message(
+    filters.private
+    & in_batch
+    & (
+        filters.document
+        | filters.video
+        | filters.audio
+        | filters.photo
+        | filters.voice
+        | filters.video_note
+        | filters.animation
+    )
+)
+async def collect_batch_file(client: Client, message: Message):
+    uid = message.from_user.id
+    try:
+        fwd = await message.forward(Config.DB_CHANNEL)
+        batch_sessions[uid].append(fwd.id)
+        n = len(batch_sessions[uid])
+        await message.reply(
+            f"**✅ FILE #{n} QUEUED**\n"
+            f"_Stored securely in the nexus._\n\n"
+            f"📦 **Queue size:** `{n}` file(s)\n"
+            f"💡 Send `/process` when done | `/cancel` to abort.",
+        )
+    except Exception as e:
+        await message.reply(f"**❌ QUEUE ERROR:** `{e}`")
+
+
+# ── /process ──────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("process") & filters.private)
+async def cmd_process(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    uid = message.from_user.id
+    session = batch_sessions.get(uid)
+
+    if not session:
+        return await message.reply(
+            "**⚠️ NO ACTIVE BATCH SESSION**\n"
+            "_Start one with `/batch` first, then send files._",
+        )
+
+    start_id = min(session)
+    end_id = max(session)
+    count = len(session)
+
+    proc = await message.reply("**⚙️ Sealing batch — generating encrypted access key...**")
+
+    link_str = encode(f"batch_{start_id}_{end_id}")
+    me = await client.get_me()
+    link = f"https://t.me/{me.username}?start={link_str}"
+
+    db = load_db()
+    db["total_links"] += 1
+    save_db(db)
+
+    del batch_sessions[uid]
+
+    await proc.edit(
+        f"**🔗 BATCH SEALED — ACCESS KEY GENERATED**\n\n"
+        f"```\n"
+        f"[ STATUS     : SUCCESS              ]\n"
+        f"[ TYPE       : BATCH SEQUENCE       ]\n"
+        f"[ FILES      : {count:<20}]\n"
+        f"[ MSG RANGE  : {start_id} → {end_id}   ]\n"
+        f"[ ENCRYPTED  : BASE64-URL           ]\n"
+        f"```\n\n"
+        f"**🌐 Batch Access Link:**\n"
+        f"`{link}`\n\n"
+        f"📋 _Share this link — delivers all {count} file(s) at once._\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ _KENSHIN FILE NEXUS_",
+    )
+
+
+# ── /stats ────────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("stats") & filters.private)
+async def cmd_stats(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    db = load_db()
+    del_time = db.get("auto_delete_time", 0)
+    del_str = f"{del_time // 60}m {del_time % 60}s" if del_time else "DISABLED"
+
+    await message.reply(
+        f"**📊 SYSTEM ANALYTICS — GLOBAL REPORT**\n\n"
+        f"```\n"
+        f"[ USERS REGISTERED  : {len(db.get('users', [])):<10}]\n"
+        f"[ ADMINS ACTIVE     : {len(db.get('admins', [])):<10}]\n"
+        f"[ TOTAL LINKS GEN.  : {db.get('total_links', 0):<10}]\n"
+        f"[ FSUB CHANNELS     : {len(db.get('fsub_channels', [])):<10}]\n"
+        f"[ START IMAGES      : {len(db.get('start_images', [])):<10}]\n"
+        f"[ AUTO-DELETE TIMER : {del_str:<10}]\n"
+        f"[ STICKER ACTIVE    : {'YES' if db.get('start_sticker') else 'NO':<10}]\n"
+        f"[ SYSTEM STATUS     : ONLINE    ]\n"
+        f"```\n\n"
+        f"⚡ _Report generated — KENSHIN FILE NEXUS_",
+    )
+
+
+# ── /broadcast ────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("broadcast") & filters.private)
+async def cmd_broadcast(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    if not message.reply_to_message:
+        return await message.reply(
+            "**⚠️ SYNTAX ERROR**\n\n"
+            "Reply to any message with `/broadcast` to\n"
+            "transmit it globally to all registered nodes.",
+        )
+
+    db = load_db()
+    users = db.get("users", [])
+    prog = await message.reply(
+        f"**📡 INITIATING GLOBAL BROADCAST**\n"
+        f"_Transmitting to `{len(users)}` registered nodes..._",
+    )
+
+    ok = fail = 0
+    for uid in users:
+        try:
+            await message.reply_to_message.forward(uid)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception:
+            fail += 1
+
+    await prog.edit(
+        f"**📡 BROADCAST — TRANSMISSION COMPLETE**\n\n"
+        f"```\n"
+        f"[ SUCCESS  : {ok} nodes reached  ]\n"
+        f"[ FAILED   : {fail} nodes offline ]\n"
+        f"[ TOTAL    : {len(users)} registered    ]\n"
+        f"```\n"
+        f"⚡ _Global frequency transmission complete._",
+    )
+
+
+# ── /add_fsub ─────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("add_fsub") & filters.private)
+async def cmd_add_fsub(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        return await message.reply(
+            "**⚠️ SYNTAX ERROR**\n\n"
+            "**Usage:**\n"
+            "`/add_fsub <channel_id> <type>`\n\n"
+            "**Channel Types:**\n"
+            "• `public` → Public channel _(join via username)_\n"
+            "• `private` → Private channel _(fresh invite link)_\n"
+            "• `request` → Private channel _(join request link)_\n\n"
+            "**Example:**\n"
+            "`/add_fsub -1001234567890 private`\n\n"
+            "⚠️ _Bot must be admin in the channel first!_",
+        )
+
+    try:
+        ch_id = int(parts[1])
+        ch_type_raw = parts[2].lower()
+
+        if ch_type_raw not in ("public", "private", "request"):
+            return await message.reply(
+                "**❌ Invalid type.**\nUse: `public`, `private`, or `request`"
+            )
+
+        ch_type = "private_request" if ch_type_raw == "request" else ch_type_raw
+        chat = await client.get_chat(ch_id)
+        ch_name = chat.title
+
+        db = load_db()
+        if any(c["id"] == ch_id for c in db["fsub_channels"]):
+            return await message.reply(
+                "**⚠️ Channel already linked in security protocol.**"
+            )
+
+        db["fsub_channels"].append({"id": ch_id, "name": ch_name, "type": ch_type})
+        save_db(db)
+
+        await message.reply(
+            f"**✅ SECURITY CHANNEL LINKED**\n\n"
+            f"```\n"
+            f"[ CHANNEL  : {ch_name[:22]:<22}]\n"
+            f"[ ID       : {ch_id}        ]\n"
+            f"[ TYPE     : {ch_type:<22}  ]\n"
+            f"[ STATUS   : ACTIVE          ]\n"
+            f"```\n"
+            f"⚡ _Users must join this channel to access any file._",
+        )
+    except Exception as e:
+        await message.reply(
+            f"**❌ OPERATION FAILED:**\n`{e}`\n\n"
+            "_Ensure the bot is an admin in the channel with invite link permission._",
+        )
+
+
+# ── /del_fsub ─────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("del_fsub") & filters.private)
+async def cmd_del_fsub(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    db = load_db()
+    channels = db.get("fsub_channels", [])
+
+    if not channels:
+        return await message.reply(
+            "**⚠️ No security channels currently configured.**"
+        )
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        ch_list = "\n".join([f"• `{c['id']}` — **{c['name']}** `[{c['type']}]`" for c in channels])
+        return await message.reply(
+            f"**📋 ACTIVE SECURITY CHANNELS:**\n\n{ch_list}\n\n"
+            f"**Usage:** `/del_fsub <channel_id>`",
+        )
+
+    try:
+        ch_id = int(parts[1])
+        before = len(channels)
+        db["fsub_channels"] = [c for c in channels if c["id"] != ch_id]
+
+        if len(db["fsub_channels"]) == before:
+            return await message.reply(
+                "**❌ Channel ID not found in security registry.**"
+            )
+
+        save_db(db)
+        await message.reply(
+            f"**🚫 SECURITY CHANNEL REMOVED**\n\n"
+            f"```\n"
+            f"[ CHANNEL ID  : {ch_id}   ]\n"
+            f"[ STATUS      : UNLINKED  ]\n"
+            f"```\n"
+            f"⚡ _Channel removed from force-sub protocol._",
+        )
+    except Exception as e:
+        await message.reply(f"**❌ Error:** `{e}`")
+
+
+# ── /set_start ────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("set_start") & filters.private)
+async def cmd_set_start(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        return await message.reply(
+            "**⚠️ SYNTAX ERROR**\n\n"
+            "**Usage:** `/set_start <your custom welcome message>`\n\n"
+            "Supports **bold**, _italic_, `code`, and all Telegram markdown.\n"
+            "Use `/del_start` to restore the default message.",
+        )
+
+    db = load_db()
+    db["start_message"] = parts[1]
+    save_db(db)
+    await message.reply(
+        "**✅ PRIMARY GREETING RECONFIGURED**\n"
+        "⚡ _New welcome message will appear on next /start._",
+    )
+
+
+@app.on_message(filters.command("del_start") & filters.private)
+async def cmd_del_start(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**")
+    db = load_db()
+    db["start_message"] = ""
+    save_db(db)
+    await message.reply("**✅ Start message reset to default.**")
+
+
+# ── /add_img ──────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("add_img") & filters.private)
+async def cmd_add_img(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    target = message.reply_to_message
+    if not target or not target.photo:
+        return await message.reply(
+            "**⚠️ Reply to a PHOTO with `/add_img` to add it to the start image rotation.**"
+        )
+
+    db = load_db()
+    db.setdefault("start_images", []).append(target.photo.file_id)
+    save_db(db)
+
+    await message.reply(
+        f"**✅ VISUAL ASSET INTEGRATED**\n\n"
+        f"```\n"
+        f"[ IMAGES IN ROTATION : {len(db['start_images'])} ]\n"
+        f"[ STATUS             : ACTIVE   ]\n"
+        f"```\n"
+        f"⚡ _Bot will randomly select from available images on each /start._",
+    )
+
+
+# ── /del_imgs ─────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("del_imgs") & filters.private)
+async def cmd_del_imgs(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    db = load_db()
+    count = len(db.get("start_images", []))
+    db["start_images"] = []
+    save_db(db)
+
+    await message.reply(
+        f"**🗑️ VISUAL MEMORY PURGED**\n\n"
+        f"```\n"
+        f"[ DELETED : {count} image(s) wiped  ]\n"
+        f"[ STATUS  : MEMORY CLEARED         ]\n"
+        f"```\n"
+        f"_Bot will display text-only start message going forward._",
+    )
+
+
+# ── /set_sticker ──────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("set_sticker") & filters.private)
+async def cmd_set_sticker(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    target = message.reply_to_message
+    if not target or not target.sticker:
+        return await message.reply(
+            "**⚠️ Reply to a STICKER with `/set_sticker` to set it as the greeting signature.**\n\n"
+            "_The sticker will appear on each /start and auto-delete after the welcome message._",
+        )
+
+    db = load_db()
+    db["start_sticker"] = target.sticker.file_id
+    save_db(db)
+
+    await message.reply(
+        "**✅ GREETING SIGNATURE CONFIGURED**\n\n"
+        "The sticker will appear on every `/start`\n"
+        "and automatically self-destruct after **5 seconds**.\n"
+        "⚡ _Signature is now active._",
+    )
+
+
+@app.on_message(filters.command("del_sticker") & filters.private)
+async def cmd_del_sticker(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**")
+    db = load_db()
+    db["start_sticker"] = ""
+    save_db(db)
+    await message.reply("**✅ Greeting sticker removed.**")
+
+
+# ── /add_admin ────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("add_admin") & filters.private)
+async def cmd_add_admin(client: Client, message: Message):
+    if message.from_user.id != Config.OWNER_ID:
+        return await message.reply("**🔒 OWNER-ONLY COMMAND.**")
+
+    target = message.reply_to_message
+    parts = message.text.split()
+
+    if target:
+        new_id = target.from_user.id
+        name = target.from_user.first_name
+    elif len(parts) > 1:
+        try:
+            new_id = int(parts[1])
+            name = f"ID#{new_id}"
+        except ValueError:
+            return await message.reply("**❌ Invalid user ID.**")
+    else:
+        return await message.reply(
+            "**⚠️ SYNTAX ERROR**\n\n"
+            "**Methods:**\n"
+            "• Reply to a user's message → `/add_admin`\n"
+            "• Or: `/add_admin <user_id>`",
+        )
+
+    db = load_db()
+    if new_id == Config.OWNER_ID or new_id in db.get("admins", []):
+        return await message.reply("**⚠️ User already has admin clearance.**")
+
+    db["admins"].append(new_id)
+    save_db(db)
+
+    await message.reply(
+        f"**✅ ADMIN CLEARANCE GRANTED**\n\n"
+        f"```\n"
+        f"[ OPERATOR  : {name[:22]:<22}]\n"
+        f"[ USER ID   : {new_id}         ]\n"
+        f"[ LEVEL     : ADMINISTRATOR    ]\n"
+        f"[ STATUS    : AUTHORIZED       ]\n"
+        f"```\n"
+        f"⚡ _Access to admin command matrix has been granted._",
+    )
+
+
+# ── /del_admin ────────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("del_admin") & filters.private)
+async def cmd_del_admin(client: Client, message: Message):
+    if message.from_user.id != Config.OWNER_ID:
+        return await message.reply("**🔒 OWNER-ONLY COMMAND.**")
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        db = load_db()
+        admins = db.get("admins", [])
+        admin_list = "\n".join([f"• `{a}`" for a in admins]) or "_None_"
+        return await message.reply(
+            f"**📋 ACTIVE ADMINISTRATORS:**\n\n{admin_list}\n\n"
+            f"**Usage:** `/del_admin <user_id>`",
+        )
+
+    try:
+        rm_id = int(parts[1])
+        if rm_id == Config.OWNER_ID:
+            return await message.reply("**❌ Cannot revoke owner clearance.**")
+
+        db = load_db()
+        if rm_id not in db.get("admins", []):
+            return await message.reply("**❌ User is not in the admin registry.**")
+
+        db["admins"].remove(rm_id)
+        save_db(db)
+
+        await message.reply(
+            f"**🚫 ADMIN CLEARANCE REVOKED**\n\n"
+            f"```\n"
+            f"[ USER ID  : {rm_id}        ]\n"
+            f"[ STATUS   : UNAUTHORIZED   ]\n"
+            f"```\n"
+            f"⚡ _Access to admin matrix has been terminated._",
+        )
+    except Exception as e:
+        await message.reply(f"**❌ Error:** `{e}`")
+
+
+# ── /set_delete_time ──────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("set_delete_time") & filters.private)
+async def cmd_set_delete_time(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply(
+            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
+        )
+
+    db = load_db()
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        current = db.get("auto_delete_time", Config.AUTO_DELETE_TIME)
+        status = f"{current // 60}m {current % 60}s" if current else "DISABLED"
+        return await message.reply(
+            f"**⏳ AUTO-PURGE CONFIGURATION**\n\n"
+            f"Current timer: `{current}s` → **{status}**\n\n"
+            f"**Usage:** `/set_delete_time <seconds>`\n"
+            f"Set `0` to **disable** auto-delete.\n\n"
+            f"**Quick Presets:**\n"
+            f"• `/set_delete_time 300` → 5 minutes\n"
+            f"• `/set_delete_time 600` → 10 minutes\n"
+            f"• `/set_delete_time 1800` → 30 minutes\n"
+            f"• `/set_delete_time 3600` → 1 hour\n"
+            f"• `/set_delete_time 0` → Disabled (files stay forever)",
+        )
+
+    try:
+        secs = int(parts[1])
+        if secs < 0:
+            return await message.reply("**❌ Value cannot be negative.**")
+
+        db["auto_delete_time"] = secs
+        save_db(db)
+
+        status = f"{secs // 60}m {secs % 60}s" if secs else "DISABLED"
+        await message.reply(
+            f"**✅ AUTO-PURGE TIMER UPDATED**\n\n"
+            f"```\n"
+            f"[ TIMER    : {status:<28}]\n"
+            f"[ SECONDS  : {secs:<28}]\n"
+            f"[ STATUS   : CONFIGURED              ]\n"
+            f"```\n"
+            f"⚡ _Files will auto-delete after delivery._",
+        )
+    except ValueError:
+        await message.reply("**❌ Invalid value.** Provide time in whole seconds (e.g. `600`).")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CALLBACK QUERY HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.on_callback_query()
+async def on_callback(client: Client, cq: CallbackQuery):
+    data = cq.data
+    uid = cq.from_user.id
+
+    # ── Verify & unlock ──────────────────────────────────────────────────────
+    if data.startswith("verify_"):
+        encoded = data[7:]
+        violations = await get_fsub_violations(client, uid)
+
+        if violations:
+            # Re-generate fresh invite links and show updated markup
+            markup = await build_fsub_markup(client, violations, encoded)
+            await cq.answer(
+                "⚠️ You haven't joined all required channels yet!",
+                show_alert=True,
+            )
+            # Update buttons with fresh links
+            try:
+                await cq.message.edit_reply_markup(markup)
+            except Exception:
+                pass
+            return
+
+        await cq.answer("✅ Verification passed! Unlocking files...", show_alert=False)
+
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+
+        await client.send_message(
+            uid,
+            "**✅ ACCESS GRANTED — INITIATING TRANSFER**\n\n"
+            "```\n"
+            "[ SECURITY CHECK  : PASSED    ]\n"
+            "[ CLEARANCE       : GRANTED   ]\n"
+            "[ FILE ACCESS     : UNLOCKED  ]\n"
+            "```\n"
+            "_Retrieving your files from the nexus..._",
+        )
+        await deliver_files(client, uid, encoded)
+
+    # ── Help / cmd popups ────────────────────────────────────────────────────
+    elif data == "cb_help":
+        await cq.answer(
+            "📚 Send /help for the full Command Matrix!", show_alert=True
+        )
+    elif data == "cb_cmds":
+        await cq.answer(
+            "⚙️ Send /help to see all available commands.", show_alert=True
+        )
+    else:
+        await cq.answer()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def main():
+    await app.start()
+    me = await app.get_me()
+
+    if not Config.DB_CHANNEL:
+        logger.warning("⚠️  DB_CHANNEL is not set! File storage will fail.")
+
+    logger.info("=" * 54)
+    logger.info("  ██╗  ██╗███████╗███╗   ██╗███████╗██╗  ██╗██╗███╗  ")
+    logger.info("  KENSHIN FILE NEXUS — SYSTEM ONLINE                  ")
+    logger.info(f"  Bot      :  @{me.username}")
+    logger.info(f"  Name     :  {me.first_name}")
+    logger.info(f"  Owner ID :  {Config.OWNER_ID}")
+    logger.info(f"  DB Chan  :  {Config.DB_CHANNEL}")
+    logger.info("=" * 54)
+
+    await idle()
+    await app.stop()
+    logger.info("KENSHIN FILE NEXUS — SHUTDOWN COMPLETE")
+
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Ultimate File Store Bot v3.0")
-    app.run()
+    asyncio.run(main())
