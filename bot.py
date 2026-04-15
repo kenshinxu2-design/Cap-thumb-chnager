@@ -17,7 +17,7 @@ from typing import List
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors import UserNotParticipant, FloodWait
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
 
