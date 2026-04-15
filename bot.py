@@ -234,10 +234,13 @@ async def start_cmd(client, message):
         
         return await msg.edit_text("<b>⚡ Files delivered. They will be DELETED in 30 minutes to avoid copyright. Save them!</b>", parse_mode=enums.ParseMode.HTML)
 
-    # Normal Start Message
+        # Normal Start Message
     sticker_msg = None
     if settings.get("start_sticker"):
-        sticker_msg = await message.reply_sticker(settings["start_sticker"])
+        try:
+            sticker_msg = await message.reply_sticker(settings["start_sticker"])
+        except Exception:
+            pass
 
     caption = settings["start_msg"].format(
         mention=message.from_user.mention, 
@@ -247,11 +250,17 @@ async def start_cmd(client, message):
     
     img = random.choice(settings["start_imgs"]) if settings["start_imgs"] else None
     
-    # Delete sticker immediately after sending the main message
-    if img:
-        await message.reply_photo(photo=img, caption=caption, parse_mode=enums.ParseMode.HTML)
-    else:
+    # --- FIXED PART START ---
+    try:
+        if img:
+            await message.reply_photo(photo=img, caption=caption, parse_mode=enums.ParseMode.HTML)
+        else:
+            await message.reply_text(caption, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        # Agar image fail ho jaye, toh bina image ke text bhej do
+        print(f"Image Error: {e}")
         await message.reply_text(caption, parse_mode=enums.ParseMode.HTML)
+    # --- FIXED PART END ---
 
     if sticker_msg:
         await asyncio.sleep(1)
