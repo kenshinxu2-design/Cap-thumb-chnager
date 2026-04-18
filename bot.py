@@ -928,10 +928,11 @@ async def on_callback(client: Client, cq: CallbackQuery):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT  — app.run() fixes the Railway/asyncio issue
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def startup():
+async def main():
+    await app.start()                      # must start BEFORE get_me()
     me = await app.get_me()
     if not Config.DB_CHANNEL:
         logger.warning("⚠️  DB_CHANNEL is not set! File storage will fail.")
@@ -943,5 +944,8 @@ async def startup():
     logger.info(f"  DB Chan  :  {Config.DB_CHANNEL}")
     logger.info(f"  Database :  MongoDB ✓")
     logger.info("=" * 54)
+    await idle()                           # keep bot alive
+    await app.stop()
+    logger.info("KENSHIN FILE NEXUS — SHUTDOWN COMPLETE")
 
-app.run(startup())
+app.run(main())
