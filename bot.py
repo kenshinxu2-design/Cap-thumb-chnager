@@ -5,12 +5,12 @@
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import random
 import time
 
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     CallbackQuery,
@@ -23,7 +23,6 @@ from pyrogram.errors import FloodWait, UserNotParticipant
 from config import Config
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -31,7 +30,6 @@ logging.basicConfig(
 logger = logging.getLogger("KenshinNexus")
 
 # ── Pyrogram Client ───────────────────────────────────────────────────────────
-
 app = Client(
     "kenshin_nexus",
     api_id=Config.API_ID,
@@ -40,61 +38,63 @@ app = Client(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE  (JSON — lightweight, no external dependency)
+#  MONGODB DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-DB_FILE = "data.json"
+mongo_client = AsyncIOMotorClient(Config.MONGO_URI)
+db_mongo     = mongo_client["kenshin_nexus"]
+settings_col = db_mongo["settings"]
+users_col    = db_mongo["users"]
 
-def _default_db() -> dict:
-    return {
+DOC_ID = "main"
+
+async def get_settings() -> dict:
+    doc = await settings_col.find_one({"_id": DOC_ID})
+    if doc:
+        return doc
+    default = {
+        "_id": DOC_ID,
         "admins": [Config.OWNER_ID],
-        "fsub_channels": [],          # [{id, name, type}]
-        "start_images": [],           # [file_id, ...]
+        "fsub_channels": [],
+        "start_images": [],
         "start_message": "",
         "start_sticker": "",
-        "users": [],
         "total_links": 0,
         "auto_delete_time": Config.AUTO_DELETE_TIME,
     }
+    await settings_col.insert_one(default)
+    return default
 
-def load_db() -> dict:
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    db = _default_db()
-    save_db(db)
-    return db
+async def update_settings(field: str, value):
+    await settings_col.update_one({"_id": DOC_ID}, {"$set": {field: value}}, upsert=True)
 
-def save_db(data: dict):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+async def register_user(uid: int):
+    await users_col.update_one({"_id": uid}, {"$set": {"_id": uid}}, upsert=True)
+
+async def get_all_users() -> list:
+    return [doc["_id"] async for doc in users_col.find({}, {"_id": 1})]
+
+async def get_total_users() -> int:
+    return await users_col.count_documents({})
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# In-memory batch sessions  {user_id: [stored_msg_ids]}
 batch_sessions: dict[int, list[int]] = {}
 
-
 def encode(s: str) -> str:
-    """Base64-URL encode a string (no padding)."""
     return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
-
 def decode(s: str) -> str:
-    """Decode a Base64-URL string (re-add padding)."""
     s += "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode()).decode()
 
+async def is_admin(uid: int) -> bool:
+    cfg = await get_settings()
+    return uid == Config.OWNER_ID or uid in cfg.get("admins", [])
 
-def is_admin(uid: int) -> bool:
-    db = load_db()
-    return uid == Config.OWNER_ID or uid in db.get("admins", [])
-
-
-async def auto_delete(client: Client, chat_id: int, msg_ids: list[int], delay: int):
-    """Delete messages after `delay` seconds."""
+async def auto_delete(client: Client, chat_id: int, msg_ids: list, delay: int):
     await asyncio.sleep(delay)
     for mid in msg_ids:
         try:
@@ -102,12 +102,17 @@ async def auto_delete(client: Client, chat_id: int, msg_ids: list[int], delay: i
         except Exception:
             pass
 
+async def _delete_after(msg: Message, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
-async def get_fsub_violations(client: Client, user_id: int) -> list[dict]:
-    """Return list of channels the user has NOT joined."""
-    db = load_db()
+async def get_fsub_violations(client: Client, user_id: int) -> list:
+    cfg = await get_settings()
     violations = []
-    for ch in db.get("fsub_channels", []):
+    for ch in cfg.get("fsub_channels", []):
         try:
             member = await client.get_chat_member(ch["id"], user_id)
             if member.status.value in ("left", "kicked", "banned"):
@@ -118,11 +123,7 @@ async def get_fsub_violations(client: Client, user_id: int) -> list[dict]:
             logger.warning(f"FSub check error [{ch['id']}]: {e}")
     return violations
 
-
-async def build_fsub_markup(
-    client: Client, violations: list[dict], encoded: str
-) -> InlineKeyboardMarkup:
-    """Build inline keyboard with join buttons + verify button."""
+async def build_fsub_markup(client: Client, violations: list, encoded: str) -> InlineKeyboardMarkup:
     buttons = []
     for ch in violations:
         try:
@@ -130,37 +131,28 @@ async def build_fsub_markup(
                 chat = await client.get_chat(ch["id"])
                 url = f"https://t.me/{chat.username}"
             elif ch["type"] == "private_request":
-                inv = await client.create_chat_invite_link(
-                    ch["id"], creates_join_request=True
-                )
+                inv = await client.create_chat_invite_link(ch["id"], creates_join_request=True)
                 url = inv.invite_link
-            else:  # private — normal invite link
+            else:
                 inv = await client.create_chat_invite_link(ch["id"])
                 url = inv.invite_link
             buttons.append([InlineKeyboardButton(f"📡  Join — {ch['name']}", url=url)])
         except Exception as e:
             logger.error(f"Button gen failed [{ch['id']}]: {e}")
-
-    buttons.append(
-        [InlineKeyboardButton("✅  I've Joined — Verify & Unlock", callback_data=f"verify_{encoded}")]
-    )
+    buttons.append([InlineKeyboardButton("✅  I've Joined — Verify & Unlock", callback_data=f"verify_{encoded}")])
     return InlineKeyboardMarkup(buttons)
 
-
 async def deliver_files(client: Client, user_id: int, encoded: str):
-    """Decode link and deliver file(s) to user."""
-    db = load_db()
-    delete_time = db.get("auto_delete_time", Config.AUTO_DELETE_TIME)
-
+    cfg = await get_settings()
+    delete_time = cfg.get("auto_delete_time", Config.AUTO_DELETE_TIME)
     try:
         decoded = decode(encoded)
     except Exception:
         await client.send_message(user_id, "**❌ CORRUPTED LINK** — Payload invalid or tampered.")
         return
 
-    sent_ids: list[int] = []
+    sent_ids = []
 
-    # ── Single file ──────────────────────────────────────────────────────────
     if decoded.startswith("file_"):
         mid = int(decoded.split("_", 1)[1])
         try:
@@ -170,12 +162,10 @@ async def deliver_files(client: Client, user_id: int, encoded: str):
             await client.send_message(user_id, f"**❌ RETRIEVAL FAILED:**\n`{e}`")
             return
 
-    # ── Batch ────────────────────────────────────────────────────────────────
     elif decoded.startswith("batch_"):
-        parts = decoded.split("_")   # ["batch", "start", "end"]
+        parts = decoded.split("_")
         s_id, e_id = int(parts[1]), int(parts[2])
         count = e_id - s_id + 1
-
         notice = await client.send_message(
             user_id,
             f"**⚡ BATCH TRANSFER SEQUENCE**\n\n"
@@ -187,7 +177,6 @@ async def deliver_files(client: Client, user_id: int, encoded: str):
             f"_Copying files from the nexus..._",
         )
         sent_ids.append(notice.id)
-
         for mid in range(s_id, e_id + 1):
             try:
                 m = await client.copy_message(user_id, Config.DB_CHANNEL, mid)
@@ -195,12 +184,10 @@ async def deliver_files(client: Client, user_id: int, encoded: str):
                 await asyncio.sleep(0.3)
             except Exception as ex:
                 logger.warning(f"Batch copy failed [{mid}]: {ex}")
-
     else:
         await client.send_message(user_id, "**❌ UNKNOWN LINK FORMAT.**")
         return
 
-    # ── Auto-delete notice ───────────────────────────────────────────────────
     if sent_ids and delete_time > 0:
         mins, secs = divmod(delete_time, 60)
         d = await client.send_message(
@@ -212,28 +199,19 @@ async def deliver_files(client: Client, user_id: int, encoded: str):
         sent_ids.append(d.id)
         asyncio.create_task(auto_delete(client, user_id, sent_ids, delete_time))
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── /start ────────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(client: Client, message: Message):
-    db = load_db()
     uid = message.from_user.id
+    await register_user(uid)
+    cfg = await get_settings()
 
-    # Register user
-    if uid not in db["users"]:
-        db["users"].append(uid)
-        save_db(db)
-
-    # ── Deep-link access ─────────────────────────────────────────────────────
     if len(message.command) > 1:
         encoded = message.command[1]
         violations = await get_fsub_violations(client, uid)
-
         if violations:
             markup = await build_fsub_markup(client, violations, encoded)
             await message.reply(
@@ -250,21 +228,17 @@ async def cmd_start(client: Client, message: Message):
                 reply_markup=markup,
             )
             return
-
         await deliver_files(client, uid, encoded)
         return
 
-    # ── Normal /start — show greeting ────────────────────────────────────────
-    # 1. Sticker (auto-deletes after welcome)
     sticker_msg = None
-    if db.get("start_sticker"):
+    if cfg.get("start_sticker"):
         try:
-            sticker_msg = await client.send_sticker(message.chat.id, db["start_sticker"])
+            sticker_msg = await client.send_sticker(message.chat.id, cfg["start_sticker"])
         except Exception:
             pass
 
-    # 2. Welcome text
-    welcome = db.get("start_message") or (
+    welcome = cfg.get("start_message") or (
         "**⚡ KENSHIN FILE NEXUS — SYSTEM ONLINE ⚡**\n\n"
         "```\n"
         "╔══════════════════════════════╗\n"
@@ -291,8 +265,7 @@ async def cmd_start(client: Client, message: Message):
         [InlineKeyboardButton("⚙️ Command Matrix", callback_data="cb_cmds")],
     ])
 
-    # 3. Send with random start image (if any)
-    images = db.get("start_images", [])
+    images = cfg.get("start_images", [])
     if images:
         try:
             await client.send_photo(
@@ -306,20 +279,9 @@ async def cmd_start(client: Client, message: Message):
     else:
         await message.reply(welcome, reply_markup=buttons)
 
-    # 4. Auto-delete sticker after 5 s
     if sticker_msg:
         asyncio.create_task(_delete_after(sticker_msg, 5))
 
-
-async def _delete_after(msg: Message, delay: int):
-    await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-
-# ── /help ─────────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, message: Message):
@@ -351,16 +313,16 @@ async def cmd_help(client: Client, message: Message):
         "`/del_fsub` → Remove a security requirement channel\n\n"
         "**━━━ 🎨 INTERFACE CONFIG ━━━**\n"
         "`/set_start` → Configure the primary greeting message\n"
+        "`/del_start` → Reset greeting to default\n"
         "`/add_img` → Insert a visual asset into start rotation\n"
         "`/del_imgs` → Wipe all visual assets from memory\n"
         "`/set_sticker` → Set the system greeting signature\n"
+        "`/del_sticker` → Remove the greeting sticker\n"
         "`/set_delete_time` → Configure auto-purge timer\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ _KENSHIN FILE NEXUS — Encrypted. Secured. Eternal._",
     )
 
-
-# ── /ping ─────────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("ping") & filters.private)
 async def cmd_ping(client: Client, message: Message):
@@ -373,14 +335,12 @@ async def cmd_ping(client: Client, message: Message):
         f"[ LATENCY    : {lat:.2f} ms            ]\n"
         f"[ API STATUS : CONNECTED               ]\n"
         f"[ ENCRYPTION : ACTIVE                  ]\n"
-        f"[ CORE NODE  : ONLINE                  ]\n"
+        f"[ DATABASE   : MONGODB                 ]\n"
         f"[ UPTIME     : STABLE                  ]\n"
         f"```\n\n"
         f"⚡ _All systems nominal. Nexus is alive._",
     )
 
-
-# ── /cancel ───────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cmd_cancel(client: Client, message: Message):
@@ -395,24 +355,19 @@ async def cmd_cancel(client: Client, message: Message):
             f"[ FILES IN QUEUE : {count:<10}]\n"
             f"[ STATUS         : STANDBY    ]\n"
             f"```\n"
-            f"_All queued data purged from memory. System on standby._",
+            f"_All queued data purged from memory._",
         )
     else:
         await message.reply(
             "**⚠️ NO ACTIVE OPERATION**\n"
-            "_System is already in standby mode._\n"
-            "Start a batch session with `/batch` first.",
+            "_System is already in standby mode._",
         )
 
-
-# ── /genlink ──────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("genlink") & filters.private)
 async def cmd_genlink(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     target = message.reply_to_message
     if not target:
@@ -426,16 +381,14 @@ async def cmd_genlink(client: Client, message: Message):
         )
 
     proc = await message.reply("**⚙️ Encrypting payload — storing in nexus...**")
-
     try:
         fwd = await target.forward(Config.DB_CHANNEL)
         link_str = encode(f"file_{fwd.id}")
         me = await client.get_me()
         link = f"https://t.me/{me.username}?start={link_str}"
 
-        db = load_db()
-        db["total_links"] += 1
-        save_db(db)
+        cfg = await get_settings()
+        await update_settings("total_links", cfg.get("total_links", 0) + 1)
 
         await proc.edit(
             f"**🔗 ENCRYPTION COMPLETE — LINK FORGED**\n\n"
@@ -455,18 +408,13 @@ async def cmd_genlink(client: Client, message: Message):
         await proc.edit(f"**❌ OPERATION FAILED:**\n`{e}`")
 
 
-# ── /batch ────────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("batch") & filters.private)
 async def cmd_batch(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     uid = message.from_user.id
     batch_sessions[uid] = []
-
     await message.reply(
         "**📦 BATCH SEQUENCE — INITIATED**\n\n"
         "```\n"
@@ -483,25 +431,15 @@ async def cmd_batch(client: Client, message: Message):
     )
 
 
-# ── Batch file collector (media only) ─────────────────────────────────────────
-
 def _in_batch(_, __, msg: Message) -> bool:
     return bool(msg.from_user and msg.from_user.id in batch_sessions)
 
-in_batch = filters.create(_in_batch)
+in_batch_filter = filters.create(_in_batch)
 
 @app.on_message(
-    filters.private
-    & in_batch
-    & (
-        filters.document
-        | filters.video
-        | filters.audio
-        | filters.photo
-        | filters.voice
-        | filters.video_note
-        | filters.animation
-    )
+    filters.private & in_batch_filter &
+    (filters.document | filters.video | filters.audio | filters.photo |
+     filters.voice | filters.video_note | filters.animation)
 )
 async def collect_batch_file(client: Client, message: Message):
     uid = message.from_user.id
@@ -519,18 +457,13 @@ async def collect_batch_file(client: Client, message: Message):
         await message.reply(f"**❌ QUEUE ERROR:** `{e}`")
 
 
-# ── /process ──────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("process") & filters.private)
 async def cmd_process(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     uid = message.from_user.id
     session = batch_sessions.get(uid)
-
     if not session:
         return await message.reply(
             "**⚠️ NO ACTIVE BATCH SESSION**\n"
@@ -540,17 +473,14 @@ async def cmd_process(client: Client, message: Message):
     start_id = min(session)
     end_id = max(session)
     count = len(session)
-
     proc = await message.reply("**⚙️ Sealing batch — generating encrypted access key...**")
 
     link_str = encode(f"batch_{start_id}_{end_id}")
     me = await client.get_me()
     link = f"https://t.me/{me.username}?start={link_str}"
 
-    db = load_db()
-    db["total_links"] += 1
-    save_db(db)
-
+    cfg = await get_settings()
+    await update_settings("total_links", cfg.get("total_links", 0) + 1)
     del batch_sessions[uid]
 
     await proc.edit(
@@ -570,53 +500,44 @@ async def cmd_process(client: Client, message: Message):
     )
 
 
-# ── /stats ────────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("stats") & filters.private)
 async def cmd_stats(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
-    db = load_db()
-    del_time = db.get("auto_delete_time", 0)
+    cfg = await get_settings()
+    total_users = await get_total_users()
+    del_time = cfg.get("auto_delete_time", 0)
     del_str = f"{del_time // 60}m {del_time % 60}s" if del_time else "DISABLED"
 
     await message.reply(
         f"**📊 SYSTEM ANALYTICS — GLOBAL REPORT**\n\n"
         f"```\n"
-        f"[ USERS REGISTERED  : {len(db.get('users', [])):<10}]\n"
-        f"[ ADMINS ACTIVE     : {len(db.get('admins', [])):<10}]\n"
-        f"[ TOTAL LINKS GEN.  : {db.get('total_links', 0):<10}]\n"
-        f"[ FSUB CHANNELS     : {len(db.get('fsub_channels', [])):<10}]\n"
-        f"[ START IMAGES      : {len(db.get('start_images', [])):<10}]\n"
+        f"[ USERS REGISTERED  : {total_users:<10}]\n"
+        f"[ ADMINS ACTIVE     : {len(cfg.get('admins', [])):<10}]\n"
+        f"[ TOTAL LINKS GEN.  : {cfg.get('total_links', 0):<10}]\n"
+        f"[ FSUB CHANNELS     : {len(cfg.get('fsub_channels', [])):<10}]\n"
+        f"[ START IMAGES      : {len(cfg.get('start_images', [])):<10}]\n"
         f"[ AUTO-DELETE TIMER : {del_str:<10}]\n"
-        f"[ STICKER ACTIVE    : {'YES' if db.get('start_sticker') else 'NO':<10}]\n"
-        f"[ SYSTEM STATUS     : ONLINE    ]\n"
+        f"[ STICKER ACTIVE    : {'YES' if cfg.get('start_sticker') else 'NO':<10}]\n"
+        f"[ DATABASE          : MONGODB    ]\n"
+        f"[ SYSTEM STATUS     : ONLINE     ]\n"
         f"```\n\n"
         f"⚡ _Report generated — KENSHIN FILE NEXUS_",
     )
 
 
-# ── /broadcast ────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("broadcast") & filters.private)
 async def cmd_broadcast(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     if not message.reply_to_message:
         return await message.reply(
-            "**⚠️ SYNTAX ERROR**\n\n"
-            "Reply to any message with `/broadcast` to\n"
-            "transmit it globally to all registered nodes.",
+            "**⚠️ SYNTAX ERROR**\n\nReply to any message with `/broadcast`."
         )
 
-    db = load_db()
-    users = db.get("users", [])
+    users = await get_all_users()
     prog = await message.reply(
         f"**📡 INITIATING GLOBAL BROADCAST**\n"
         f"_Transmitting to `{len(users)}` registered nodes..._",
@@ -644,85 +565,65 @@ async def cmd_broadcast(client: Client, message: Message):
     )
 
 
-# ── /add_fsub ─────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("add_fsub") & filters.private)
 async def cmd_add_fsub(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     parts = message.text.split()
     if len(parts) < 3:
         return await message.reply(
             "**⚠️ SYNTAX ERROR**\n\n"
-            "**Usage:**\n"
-            "`/add_fsub <channel_id> <type>`\n\n"
-            "**Channel Types:**\n"
-            "• `public` → Public channel _(join via username)_\n"
-            "• `private` → Private channel _(fresh invite link)_\n"
-            "• `request` → Private channel _(join request link)_\n\n"
-            "**Example:**\n"
-            "`/add_fsub -1001234567890 private`\n\n"
+            "**Usage:** `/add_fsub <channel_id> <type>`\n\n"
+            "**Types:**\n"
+            "• `public` → Public channel\n"
+            "• `private` → Private channel (invite link)\n"
+            "• `request` → Private channel (join request)\n\n"
+            "**Example:** `/add_fsub -1001234567890 private`\n\n"
             "⚠️ _Bot must be admin in the channel first!_",
         )
 
     try:
         ch_id = int(parts[1])
         ch_type_raw = parts[2].lower()
-
         if ch_type_raw not in ("public", "private", "request"):
-            return await message.reply(
-                "**❌ Invalid type.**\nUse: `public`, `private`, or `request`"
-            )
+            return await message.reply("**❌ Invalid type.** Use: `public`, `private`, or `request`")
 
         ch_type = "private_request" if ch_type_raw == "request" else ch_type_raw
         chat = await client.get_chat(ch_id)
         ch_name = chat.title
 
-        db = load_db()
-        if any(c["id"] == ch_id for c in db["fsub_channels"]):
-            return await message.reply(
-                "**⚠️ Channel already linked in security protocol.**"
-            )
+        cfg = await get_settings()
+        if any(c["id"] == ch_id for c in cfg["fsub_channels"]):
+            return await message.reply("**⚠️ Channel already linked in security protocol.**")
 
-        db["fsub_channels"].append({"id": ch_id, "name": ch_name, "type": ch_type})
-        save_db(db)
+        cfg["fsub_channels"].append({"id": ch_id, "name": ch_name, "type": ch_type})
+        await update_settings("fsub_channels", cfg["fsub_channels"])
 
         await message.reply(
             f"**✅ SECURITY CHANNEL LINKED**\n\n"
             f"```\n"
             f"[ CHANNEL  : {ch_name[:22]:<22}]\n"
-            f"[ ID       : {ch_id}        ]\n"
-            f"[ TYPE     : {ch_type:<22}  ]\n"
-            f"[ STATUS   : ACTIVE          ]\n"
+            f"[ ID       : {ch_id}          ]\n"
+            f"[ TYPE     : {ch_type:<22}    ]\n"
+            f"[ STATUS   : ACTIVE            ]\n"
             f"```\n"
             f"⚡ _Users must join this channel to access any file._",
         )
     except Exception as e:
-        await message.reply(
-            f"**❌ OPERATION FAILED:**\n`{e}`\n\n"
-            "_Ensure the bot is an admin in the channel with invite link permission._",
-        )
+        await message.reply(f"**❌ OPERATION FAILED:**\n`{e}`\n\n_Ensure bot is admin in the channel._")
 
-
-# ── /del_fsub ─────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("del_fsub") & filters.private)
 async def cmd_del_fsub(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
-    db = load_db()
-    channels = db.get("fsub_channels", [])
+    cfg = await get_settings()
+    channels = cfg.get("fsub_channels", [])
 
     if not channels:
-        return await message.reply(
-            "**⚠️ No security channels currently configured.**"
-        )
+        return await message.reply("**⚠️ No security channels currently configured.**")
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -734,15 +635,11 @@ async def cmd_del_fsub(client: Client, message: Message):
 
     try:
         ch_id = int(parts[1])
-        before = len(channels)
-        db["fsub_channels"] = [c for c in channels if c["id"] != ch_id]
+        new_list = [c for c in channels if c["id"] != ch_id]
+        if len(new_list) == len(channels):
+            return await message.reply("**❌ Channel ID not found in security registry.**")
 
-        if len(db["fsub_channels"]) == before:
-            return await message.reply(
-                "**❌ Channel ID not found in security registry.**"
-            )
-
-        save_db(db)
+        await update_settings("fsub_channels", new_list)
         await message.reply(
             f"**🚫 SECURITY CHANNEL REMOVED**\n\n"
             f"```\n"
@@ -755,27 +652,21 @@ async def cmd_del_fsub(client: Client, message: Message):
         await message.reply(f"**❌ Error:** `{e}`")
 
 
-# ── /set_start ────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("set_start") & filters.private)
 async def cmd_set_start(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     parts = message.text.split(None, 1)
     if len(parts) < 2:
         return await message.reply(
             "**⚠️ SYNTAX ERROR**\n\n"
             "**Usage:** `/set_start <your custom welcome message>`\n\n"
-            "Supports **bold**, _italic_, `code`, and all Telegram markdown.\n"
+            "Supports **bold**, _italic_, `code` formatting.\n"
             "Use `/del_start` to restore the default message.",
         )
 
-    db = load_db()
-    db["start_message"] = parts[1]
-    save_db(db)
+    await update_settings("start_message", parts[1])
     await message.reply(
         "**✅ PRIMARY GREETING RECONFIGURED**\n"
         "⚡ _New welcome message will appear on next /start._",
@@ -784,22 +675,16 @@ async def cmd_set_start(client: Client, message: Message):
 
 @app.on_message(filters.command("del_start") & filters.private)
 async def cmd_del_start(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         return await message.reply("**🔒 CLEARANCE DENIED**")
-    db = load_db()
-    db["start_message"] = ""
-    save_db(db)
+    await update_settings("start_message", "")
     await message.reply("**✅ Start message reset to default.**")
 
 
-# ── /add_img ──────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("add_img") & filters.private)
 async def cmd_add_img(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     target = message.reply_to_message
     if not target or not target.photo:
@@ -807,64 +692,51 @@ async def cmd_add_img(client: Client, message: Message):
             "**⚠️ Reply to a PHOTO with `/add_img` to add it to the start image rotation.**"
         )
 
-    db = load_db()
-    db.setdefault("start_images", []).append(target.photo.file_id)
-    save_db(db)
+    cfg = await get_settings()
+    images = cfg.get("start_images", [])
+    images.append(target.photo.file_id)
+    await update_settings("start_images", images)
 
     await message.reply(
         f"**✅ VISUAL ASSET INTEGRATED**\n\n"
         f"```\n"
-        f"[ IMAGES IN ROTATION : {len(db['start_images'])} ]\n"
+        f"[ IMAGES IN ROTATION : {len(images)} ]\n"
         f"[ STATUS             : ACTIVE   ]\n"
         f"```\n"
         f"⚡ _Bot will randomly select from available images on each /start._",
     )
 
 
-# ── /del_imgs ─────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("del_imgs") & filters.private)
 async def cmd_del_imgs(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
-    db = load_db()
-    count = len(db.get("start_images", []))
-    db["start_images"] = []
-    save_db(db)
-
+    cfg = await get_settings()
+    count = len(cfg.get("start_images", []))
+    await update_settings("start_images", [])
     await message.reply(
         f"**🗑️ VISUAL MEMORY PURGED**\n\n"
         f"```\n"
         f"[ DELETED : {count} image(s) wiped  ]\n"
         f"[ STATUS  : MEMORY CLEARED         ]\n"
-        f"```\n"
-        f"_Bot will display text-only start message going forward._",
+        f"```",
     )
 
 
-# ── /set_sticker ──────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("set_sticker") & filters.private)
 async def cmd_set_sticker(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
     target = message.reply_to_message
     if not target or not target.sticker:
         return await message.reply(
-            "**⚠️ Reply to a STICKER with `/set_sticker` to set it as the greeting signature.**\n\n"
-            "_The sticker will appear on each /start and auto-delete after the welcome message._",
+            "**⚠️ Reply to a STICKER with `/set_sticker`.**\n\n"
+            "_The sticker will appear on each /start and auto-delete after 5 seconds._",
         )
 
-    db = load_db()
-    db["start_sticker"] = target.sticker.file_id
-    save_db(db)
-
+    await update_settings("start_sticker", target.sticker.file_id)
     await message.reply(
         "**✅ GREETING SIGNATURE CONFIGURED**\n\n"
         "The sticker will appear on every `/start`\n"
@@ -875,15 +747,11 @@ async def cmd_set_sticker(client: Client, message: Message):
 
 @app.on_message(filters.command("del_sticker") & filters.private)
 async def cmd_del_sticker(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         return await message.reply("**🔒 CLEARANCE DENIED**")
-    db = load_db()
-    db["start_sticker"] = ""
-    save_db(db)
+    await update_settings("start_sticker", "")
     await message.reply("**✅ Greeting sticker removed.**")
 
-
-# ── /add_admin ────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command("add_admin") & filters.private)
 async def cmd_add_admin(client: Client, message: Message):
@@ -905,17 +773,17 @@ async def cmd_add_admin(client: Client, message: Message):
     else:
         return await message.reply(
             "**⚠️ SYNTAX ERROR**\n\n"
-            "**Methods:**\n"
             "• Reply to a user's message → `/add_admin`\n"
             "• Or: `/add_admin <user_id>`",
         )
 
-    db = load_db()
-    if new_id == Config.OWNER_ID or new_id in db.get("admins", []):
+    cfg = await get_settings()
+    if new_id == Config.OWNER_ID or new_id in cfg.get("admins", []):
         return await message.reply("**⚠️ User already has admin clearance.**")
 
-    db["admins"].append(new_id)
-    save_db(db)
+    admins = cfg.get("admins", [])
+    admins.append(new_id)
+    await update_settings("admins", admins)
 
     await message.reply(
         f"**✅ ADMIN CLEARANCE GRANTED**\n\n"
@@ -929,8 +797,6 @@ async def cmd_add_admin(client: Client, message: Message):
     )
 
 
-# ── /del_admin ────────────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("del_admin") & filters.private)
 async def cmd_del_admin(client: Client, message: Message):
     if message.from_user.id != Config.OWNER_ID:
@@ -938,8 +804,8 @@ async def cmd_del_admin(client: Client, message: Message):
 
     parts = message.text.split()
     if len(parts) < 2:
-        db = load_db()
-        admins = db.get("admins", [])
+        cfg = await get_settings()
+        admins = cfg.get("admins", [])
         admin_list = "\n".join([f"• `{a}`" for a in admins]) or "_None_"
         return await message.reply(
             f"**📋 ACTIVE ADMINISTRATORS:**\n\n{admin_list}\n\n"
@@ -951,12 +817,13 @@ async def cmd_del_admin(client: Client, message: Message):
         if rm_id == Config.OWNER_ID:
             return await message.reply("**❌ Cannot revoke owner clearance.**")
 
-        db = load_db()
-        if rm_id not in db.get("admins", []):
+        cfg = await get_settings()
+        admins = cfg.get("admins", [])
+        if rm_id not in admins:
             return await message.reply("**❌ User is not in the admin registry.**")
 
-        db["admins"].remove(rm_id)
-        save_db(db)
+        admins.remove(rm_id)
+        await update_settings("admins", admins)
 
         await message.reply(
             f"**🚫 ADMIN CLEARANCE REVOKED**\n\n"
@@ -970,49 +837,41 @@ async def cmd_del_admin(client: Client, message: Message):
         await message.reply(f"**❌ Error:** `{e}`")
 
 
-# ── /set_delete_time ──────────────────────────────────────────────────────────
-
 @app.on_message(filters.command("set_delete_time") & filters.private)
 async def cmd_set_delete_time(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply(
-            "**🔒 CLEARANCE DENIED**\n_Administrator access required._"
-        )
+    if not await is_admin(message.from_user.id):
+        return await message.reply("**🔒 CLEARANCE DENIED**\n_Administrator access required._")
 
-    db = load_db()
+    cfg = await get_settings()
     parts = message.text.split()
 
     if len(parts) < 2:
-        current = db.get("auto_delete_time", Config.AUTO_DELETE_TIME)
+        current = cfg.get("auto_delete_time", Config.AUTO_DELETE_TIME)
         status = f"{current // 60}m {current % 60}s" if current else "DISABLED"
         return await message.reply(
             f"**⏳ AUTO-PURGE CONFIGURATION**\n\n"
             f"Current timer: `{current}s` → **{status}**\n\n"
             f"**Usage:** `/set_delete_time <seconds>`\n"
             f"Set `0` to **disable** auto-delete.\n\n"
-            f"**Quick Presets:**\n"
-            f"• `/set_delete_time 300` → 5 minutes\n"
-            f"• `/set_delete_time 600` → 10 minutes\n"
-            f"• `/set_delete_time 1800` → 30 minutes\n"
+            f"**Presets:**\n"
+            f"• `/set_delete_time 300` → 5 min\n"
+            f"• `/set_delete_time 600` → 10 min\n"
+            f"• `/set_delete_time 1800` → 30 min\n"
             f"• `/set_delete_time 3600` → 1 hour\n"
-            f"• `/set_delete_time 0` → Disabled (files stay forever)",
+            f"• `/set_delete_time 0` → Disabled",
         )
 
     try:
         secs = int(parts[1])
         if secs < 0:
             return await message.reply("**❌ Value cannot be negative.**")
-
-        db["auto_delete_time"] = secs
-        save_db(db)
-
+        await update_settings("auto_delete_time", secs)
         status = f"{secs // 60}m {secs % 60}s" if secs else "DISABLED"
         await message.reply(
             f"**✅ AUTO-PURGE TIMER UPDATED**\n\n"
             f"```\n"
-            f"[ TIMER    : {status:<28}]\n"
-            f"[ SECONDS  : {secs:<28}]\n"
-            f"[ STATUS   : CONFIGURED              ]\n"
+            f"[ TIMER   : {status:<28}]\n"
+            f"[ SECONDS : {secs:<28}]\n"
             f"```\n"
             f"⚡ _Files will auto-delete after delivery._",
         )
@@ -1029,19 +888,13 @@ async def on_callback(client: Client, cq: CallbackQuery):
     data = cq.data
     uid = cq.from_user.id
 
-    # ── Verify & unlock ──────────────────────────────────────────────────────
     if data.startswith("verify_"):
         encoded = data[7:]
         violations = await get_fsub_violations(client, uid)
 
         if violations:
-            # Re-generate fresh invite links and show updated markup
             markup = await build_fsub_markup(client, violations, encoded)
-            await cq.answer(
-                "⚠️ You haven't joined all required channels yet!",
-                show_alert=True,
-            )
-            # Update buttons with fresh links
+            await cq.answer("⚠️ You haven't joined all required channels yet!", show_alert=True)
             try:
                 await cq.message.edit_reply_markup(markup)
             except Exception:
@@ -1049,7 +902,6 @@ async def on_callback(client: Client, cq: CallbackQuery):
             return
 
         await cq.answer("✅ Verification passed! Unlocking files...", show_alert=False)
-
         try:
             await cq.message.delete()
         except Exception:
@@ -1067,43 +919,29 @@ async def on_callback(client: Client, cq: CallbackQuery):
         )
         await deliver_files(client, uid, encoded)
 
-    # ── Help / cmd popups ────────────────────────────────────────────────────
     elif data == "cb_help":
-        await cq.answer(
-            "📚 Send /help for the full Command Matrix!", show_alert=True
-        )
+        await cq.answer("📚 Send /help for the full Command Matrix!", show_alert=True)
     elif data == "cb_cmds":
-        await cq.answer(
-            "⚙️ Send /help to see all available commands.", show_alert=True
-        )
+        await cq.answer("⚙️ Send /help to see all available commands.", show_alert=True)
     else:
         await cq.answer()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
+#  ENTRY POINT  — app.run() fixes the Railway/asyncio issue
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def main():
-    await app.start()
+async def startup():
     me = await app.get_me()
-
     if not Config.DB_CHANNEL:
         logger.warning("⚠️  DB_CHANNEL is not set! File storage will fail.")
-
     logger.info("=" * 54)
-    logger.info("  ██╗  ██╗███████╗███╗   ██╗███████╗██╗  ██╗██╗███╗  ")
-    logger.info("  KENSHIN FILE NEXUS — SYSTEM ONLINE                  ")
+    logger.info("  KENSHIN FILE NEXUS — SYSTEM ONLINE")
     logger.info(f"  Bot      :  @{me.username}")
     logger.info(f"  Name     :  {me.first_name}")
     logger.info(f"  Owner ID :  {Config.OWNER_ID}")
     logger.info(f"  DB Chan  :  {Config.DB_CHANNEL}")
+    logger.info(f"  Database :  MongoDB ✓")
     logger.info("=" * 54)
 
-    await idle()
-    await app.stop()
-    logger.info("KENSHIN FILE NEXUS — SHUTDOWN COMPLETE")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+app.run(startup())
