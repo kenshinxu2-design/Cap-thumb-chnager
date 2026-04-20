@@ -1,4 +1,1 @@
-pyrofork
-tgcrypto
-motor
-pymongo
+python-telegram-bot==21.10
