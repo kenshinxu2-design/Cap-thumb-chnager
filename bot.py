@@ -2,7 +2,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import asyncio
 
-TOKEN = 8780999113:AAHsYS_e6MoWfEq1LOwkqoJIW-cvIYTSTcI
+BOT_TOKEN = 8780999113:AAHsYS_e6MoWfEq1LOwkqoJIW-cvIYTSTcI
 OWNER_ID = 8781983541,6728678197
 
 # SETTINGS
